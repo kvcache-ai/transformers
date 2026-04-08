@@ -81,12 +81,11 @@ def initialize_tensor_parallelism(tp_plan, tp_size=None):
     index = current_device.current_device() if device_type != "cpu" else None
     tp_device = torch.device(device_type, index)
 
-    # Silence output for non-primary ranks
+    # Keep stderr open on non-primary ranks so error tracebacks are visible
     if index is not None and index > 0:
         import sys
 
         sys.stdout = open(os.devnull, "w")
-        sys.stderr = open(os.devnull, "w")
 
     device_map = tp_device
     tp_size = tp_size if tp_size is not None else torch.distributed.get_world_size()

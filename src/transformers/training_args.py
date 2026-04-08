@@ -825,6 +825,7 @@ class TrainingArguments:
         "accelerator_config",
         "fsdp_config",
         "deepspeed",
+        "kt_config",
         "gradient_checkpointing_kwargs",
         "lr_scheduler_kwargs",
     ]
@@ -1282,6 +1283,15 @@ class TrainingArguments:
             "help": (
                 "Enable deepspeed and pass the path to deepspeed json config file (e.g. `ds_config.json`) or an already"
                 " loaded json file as a dict"
+            )
+        },
+    )
+    kt_config: Optional[Union[dict, str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable KTransformers and pass a KT config dict or path to a json config file. "
+                "KTransformers accelerates MoE models using CPU AMX instructions."
             )
         },
     )
@@ -1805,6 +1815,45 @@ class TrainingArguments:
                     "Using `split_batches=True` in `accelerator_config` will override the `per_device_train_batch_size` "
                     "Batches will be split across all processes equally when using `split_batches=True`."
                 )
+
+        # KT integration (must run before the model is created, similar to DeepSpeed).
+        # Priority: self.kt_config > accelerator_config.kt_config > ACCELERATE_USE_KT env var
+        kt_config_dict = None
+
+        # Check self.kt_config first (similar to self.deepspeed)
+        if self.kt_config is not None:
+            if isinstance(self.kt_config, str):
+                # Load from JSON file
+                import json
+                with open(self.kt_config, "r") as f:
+                    kt_config_dict = json.load(f)
+            else:
+                kt_config_dict = self.kt_config
+
+        # Fall back to accelerator_config.kt_config
+        if kt_config_dict is None and is_accelerate_available() and self.accelerator_config is not None:
+            kt_config_dict = getattr(self.accelerator_config, "kt_config", None)
+
+        # Default to skipping expert weight loading when KT is enabled.
+        if isinstance(kt_config_dict, dict):
+            kt_config_dict.setdefault("enabled", True)
+            kt_config_dict.setdefault("kt_skip_expert_loading", True)
+
+        if kt_config_dict is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
+            if not is_accelerate_available():
+                raise ValueError(
+                    f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`."
+                )
+            from .integrations.kt import HfTrainerKTConfig
+
+            # Keep a strong reference on `TrainingArguments` so the weakref stays alive.
+            self.hf_kt_config = HfTrainerKTConfig(kt_config_dict)
+            if getattr(self.hf_kt_config, "enabled", False):
+                os.environ["ACCELERATE_USE_KT"] = "true"
+
+            # Also set kt_config on accelerator_config for Trainer/Accelerator to use later
+            if self.accelerator_config is not None and kt_config_dict is not None:
+                self.accelerator_config.kt_config = kt_config_dict
 
         # Initialize device before we proceed
         if self.framework == "pt" and is_torch_available():

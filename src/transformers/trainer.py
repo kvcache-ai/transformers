@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import warnings
+from datetime import datetime
 from collections.abc import Iterator, Mapping
 from functools import partial
 from pathlib import Path
@@ -219,6 +220,8 @@ else:
 if is_peft_available():
     from peft import PeftModel
 
+_accelerate_supports_kt_config = False
+
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches
     from accelerate import __version__ as accelerate_version
@@ -232,6 +235,25 @@ if is_accelerate_available():
         save_fsdp_model,
         save_fsdp_optimizer,
     )
+
+    try:
+        from accelerate.utils import KTransformersPlugin
+        _accelerate_supports_kt_config = "kt_config" in inspect.signature(Accelerator).parameters
+    except ImportError:
+        KTransformersPlugin = None
+        _accelerate_supports_kt_config = False
+
+    try:
+        from kt_kernel.sft import (
+            get_kt_lora_params,
+            kt_adapt_peft_lora,
+            load_kt_moe_from_adapter,
+            save_kt_moe_to_adapter,
+            sync_kt_lora_gradients,
+            update_kt_lora_pointers,
+        )
+    except ImportError:
+        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = sync_kt_lora_gradients = update_kt_lora_pointers = None
 
     DATA_SAMPLERS = [RandomSampler]
     if version.parse(accelerate_version) > version.parse("1.3.0"):
@@ -1320,6 +1342,127 @@ class Trainer:
             # to avoid arguments conflicts.
             if "optimizer_dict" in optimizer_kwargs:
                 optimizer_grouped_parameters = optimizer_kwargs.pop("optimizer_dict")
+
+            if (
+                self.is_kt_enabled
+                and isinstance(optimizer_grouped_parameters, list)
+                and optimizer_grouped_parameters
+                and isinstance(optimizer_grouped_parameters[0], dict)
+                and "params" in optimizer_grouped_parameters[0]
+            ):
+                split_groups = []
+                for group in optimizer_grouped_parameters:
+                    params = group.get("params", [])
+                    cpu_params = []
+                    cuda_params = []
+                    other_params = []
+                    for p in params:
+                        device_type = getattr(getattr(p, "device", None), "type", None)
+                        if device_type == "cpu":
+                            cpu_params.append(p)
+                        elif device_type == "cuda":
+                            cuda_params.append(p)
+                        else:
+                            other_params.append(p)
+
+                    base_group = {k: v for k, v in group.items() if k != "params"}
+                    if cpu_params:
+                        g = dict(base_group)
+                        g["params"] = cpu_params
+                        split_groups.append(g)
+                    if cuda_params:
+                        g = dict(base_group)
+                        g["params"] = cuda_params
+                        split_groups.append(g)
+                    if other_params:
+                        g = dict(base_group)
+                        g["params"] = other_params
+                        split_groups.append(g)
+
+                optimizer_grouped_parameters = split_groups
+
+            is_fsdp2 = self.is_fsdp_enabled and (getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2)
+            if (
+                self.is_kt_enabled
+                and get_kt_lora_params is not None
+                and not is_fsdp2
+                and isinstance(optimizer_grouped_parameters, list)
+                and optimizer_grouped_parameters
+                and isinstance(optimizer_grouped_parameters[0], dict)
+                and "params" in optimizer_grouped_parameters[0]
+            ):
+                kt_model = self.accelerator.unwrap_model(opt_model, keep_torch_compile=False)
+                wrappers = getattr(kt_model, "_kt_wrappers", None)
+                if wrappers is None:
+                    base_model = kt_model
+                    for attr in ("base_model", "model"):
+                        if hasattr(base_model, attr):
+                            base_model = getattr(base_model, attr)
+                            wrappers = getattr(base_model, "_kt_wrappers", None)
+                            if wrappers:
+                                break
+
+                storage_to_fused_param = {}
+                if wrappers:
+                    lora_keys = (
+                        "gate_lora_a",
+                        "gate_lora_b",
+                        "up_lora_a",
+                        "up_lora_b",
+                        "down_lora_a",
+                        "down_lora_b",
+                    )
+                    for wrapper in wrappers:
+                        backend_wrapper = getattr(wrapper, "wrapper", None)
+                        if backend_wrapper is None:
+                            continue
+                        fused_params = {}
+                        for key in lora_keys:
+                            tensor = getattr(backend_wrapper, key, None)
+                            if not isinstance(tensor, torch.Tensor):
+                                continue
+                            fused_param = nn.Parameter(tensor, requires_grad=True)
+                            grad_tensor = getattr(backend_wrapper, f"grad_{key}", None)
+                            if isinstance(grad_tensor, torch.Tensor):
+                                fused_param.grad = grad_tensor
+                            storage_to_fused_param[tensor.untyped_storage().data_ptr()] = fused_param
+                            fused_params[key] = fused_param
+                        if fused_params:
+                            wrapper._kt_fused_lora_params = fused_params
+
+                if storage_to_fused_param:
+                    kt_lora_params = get_kt_lora_params(kt_model)
+                    kt_lora_param_ids = {id(p) for p in kt_lora_params}
+                    added_fused_ids = set()
+                    for group in optimizer_grouped_parameters:
+                        kept_params = []
+                        removed_storage_ptrs = []
+                        for param in group.get("params", []):
+                            if id(param) in kt_lora_param_ids:
+                                removed_storage_ptrs.append(param.untyped_storage().data_ptr())
+                            else:
+                                kept_params.append(param)
+                        for storage_ptr in dict.fromkeys(removed_storage_ptrs):
+                            fused_param = storage_to_fused_param.get(storage_ptr)
+                            if fused_param is not None and id(fused_param) not in added_fused_ids:
+                                kept_params.append(fused_param)
+                                added_fused_ids.add(id(fused_param))
+                        group["params"] = kept_params
+
+                    if optimizer_grouped_parameters:
+                        first_group_params = optimizer_grouped_parameters[0].get("params", [])
+                        for fused_param in storage_to_fused_param.values():
+                            if id(fused_param) not in added_fused_ids:
+                                first_group_params.append(fused_param)
+                                added_fused_ids.add(id(fused_param))
+                        optimizer_grouped_parameters[0]["params"] = first_group_params
+
+                    self._kt_fused_optimizer_params = list(storage_to_fused_param.values())
+                    if hasattr(self, "accelerator"):
+                        # Accelerate has a one-time safety path in `backward()` that auto-adds
+                        # per-expert KT LoRA params when it thinks they are missing from the optimizer.
+                        # Once we replace those params with fused KT tensors, that injection must be skipped.
+                        self.accelerator._kt_lora_injected = True
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
@@ -2429,6 +2572,9 @@ class Trainer:
             self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
 
         if not delay_optimizer_creation:
+            # NOTE: kt_adapt_peft_lora is called AFTER prepare() — see below.
+            # FSDP2's prepare does model.to(meta) + load_state_dict(assign=True) which
+            # destroys any .grad views set before prepare. So we must set them after.
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         self.state = TrainerState(
@@ -2464,6 +2610,7 @@ class Trainer:
                 self._fsdp_qlora_plugin_updates()
                 if self.accelerator.mixed_precision != "fp8":
                     self.model = self.accelerator.prepare(self.model)
+            # NOTE: kt_adapt_peft_lora is called AFTER prepare() — see below.
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         # prepare using `accelerator` prepare
@@ -2497,6 +2644,103 @@ class Trainer:
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model_wrapped
 
+        # KT LoRA adaptation: MUST happen AFTER all prepare() calls.
+        # FSDP2's prepare does model.to(meta) + load_state_dict(assign=True) which
+        # creates new param objects and destroys any .grad views set earlier.
+        # By calling kt_adapt_peft_lora here, we set buffer views and .grad on
+        # the finalized param objects that are already in both model and optimizer.
+        if self.is_kt_enabled and kt_adapt_peft_lora is not None:
+            kt_model = self.accelerator.unwrap_model(
+                self.model, keep_torch_compile=False,
+            )
+            kt_adapt_peft_lora(kt_model)
+
+            # FSDP2 optimizer fusion: replace 89k individual CPU LoRA param views
+            # with ~348 contiguous buffer params.  Mirrors the non-FSDP fusion at
+            # create_optimizer() (lines 1400-1460) but runs here because FSDP2's
+            # model.to("meta") + load_state_dict(assign=True) would destroy views
+            # set before prepare().
+            if self.is_fsdp_enabled:
+                import torch.distributed as dist
+
+                raw_opt = self.optimizer
+                while hasattr(raw_opt, "optimizer"):
+                    raw_opt = raw_opt.optimizer
+
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                if rank == 0:
+                    wrappers = getattr(kt_model, "_kt_wrappers", None)
+                    if wrappers is None:
+                        _base = kt_model
+                        for attr in ("base_model", "model"):
+                            if hasattr(_base, attr):
+                                _base = getattr(_base, attr)
+                                wrappers = getattr(_base, "_kt_wrappers", None)
+                                if wrappers:
+                                    break
+
+                    storage_to_fused_param = {}
+                    lora_keys = (
+                        "gate_lora_a", "gate_lora_b",
+                        "up_lora_a", "up_lora_b",
+                        "down_lora_a", "down_lora_b",
+                    )
+                    if wrappers:
+                        for wrapper in wrappers:
+                            backend_wrapper = getattr(wrapper, "wrapper", None)
+                            if backend_wrapper is None:
+                                continue
+                            fused_params = {}
+                            for key in lora_keys:
+                                tensor = getattr(backend_wrapper, key, None)
+                                if not isinstance(tensor, torch.Tensor):
+                                    continue
+                                fused_param = nn.Parameter(tensor, requires_grad=True)
+                                grad_tensor = getattr(backend_wrapper, f"grad_{key}", None)
+                                if isinstance(grad_tensor, torch.Tensor):
+                                    fused_param.grad = grad_tensor
+                                storage_to_fused_param[tensor.untyped_storage().data_ptr()] = fused_param
+                                fused_params[key] = fused_param
+                            if fused_params:
+                                wrapper._kt_fused_lora_params = fused_params
+
+                    if storage_to_fused_param:
+                        # Only fuse CPU LoRA buffer params (from C++ kernel), not GPU lora_experts params
+                        kt_lora_params = get_kt_lora_params(kt_model)
+                        kt_cpu_lora_param_ids = {id(p) for p in kt_lora_params if p.device.type == "cpu"}
+                        added_fused_ids = set()
+                        for group in raw_opt.param_groups:
+                            kept_params = []
+                            removed_storage_ptrs = []
+                            for param in group["params"]:
+                                if id(param) in kt_cpu_lora_param_ids:
+                                    removed_storage_ptrs.append(param.untyped_storage().data_ptr())
+                                else:
+                                    kept_params.append(param)
+                            for storage_ptr in dict.fromkeys(removed_storage_ptrs):
+                                fused_param = storage_to_fused_param.get(storage_ptr)
+                                if fused_param is not None and id(fused_param) not in added_fused_ids:
+                                    kept_params.append(fused_param)
+                                    added_fused_ids.add(id(fused_param))
+                            group["params"] = kept_params
+
+                        self._kt_fused_optimizer_params = list(storage_to_fused_param.values())
+                        logger.info(
+                            "[KT] FSDP2 optimizer fusion: %d fused buffer params replace %d individual params",
+                            len(storage_to_fused_param), len(kt_cpu_lora_param_ids),
+                        )
+                else:
+                    # Non-rank-0: remove CPU params from optimizer (KT MoE only runs on rank 0)
+                    for group in raw_opt.param_groups:
+                        group["params"] = [
+                            p for p in group["params"]
+                            if getattr(p.device, "type", None) not in ("cpu", "meta")
+                        ]
+
+                # Prevent accelerator.backward() safety path from re-adding
+                # the 89k individual params that were just replaced/removed.
+                self.accelerator._kt_lora_injected = True
+
         # ckpt loading
         if resume_from_checkpoint is not None:
             if self.is_deepspeed_enabled:
@@ -2505,6 +2749,11 @@ class Trainer:
                 )
             elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
                 self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        # Load KT MoE lora_experts weights from checkpoint (if any)
+        if self.is_kt_enabled and load_kt_moe_from_adapter is not None and resume_from_checkpoint is not None:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            load_kt_moe_from_adapter(kt_model, resume_from_checkpoint)
 
         # Check if saved optimizer or scheduler states exist
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
@@ -2567,7 +2816,11 @@ class Trainer:
         # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
-        model.zero_grad()
+        if self.is_kt_enabled:
+            # Keep KT LoRA grad views alive (avoid set_to_none=True clearing them).
+            self.optimizer.zero_grad(set_to_none=False)
+        else:
+            model.zero_grad()
         grad_norm: Optional[float] = None
         learning_rate = None
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
@@ -2663,11 +2916,40 @@ class Trainer:
                     if step % args.gradient_accumulation_steps == 0:
                         self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                    # We explicitly want to avoid relying on `accelerator.accumulate` for generation training
+                    # Disabled by local patch: do not override `no_sync` behavior for KT/GC.
+                    # model_gc_enabled = bool(getattr(model, "is_gradient_checkpointing", False))
+                    # if not model_gc_enabled and hasattr(model, "module"):
+                    #     model_gc_enabled = bool(getattr(model.module, "is_gradient_checkpointing", False))
+                    # gc_enabled = bool(getattr(args, "gradient_checkpointing", False) or model_gc_enabled)
+                    # disable_no_sync = bool(getattr(self, "is_kt_enabled", False) and gc_enabled)
+                    model_gc_enabled = False
+                    disable_no_sync = False
+
+                    if (
+                        os.environ.get("ACCELERATE_KT_MEM_LOG", "0") == "1"
+                        and getattr(self, "is_kt_enabled", False)
+                        and getattr(self, "_kt_no_sync_debug_count", 0) < 256
+                    ):
+                        rank = os.environ.get("RANK", "0")
+                        path_tpl = os.environ.get("ACCELERATE_KT_MEM_LOG_FILE", "kt_mem_rank{rank}.log")
+                        path = path_tpl.format(rank=rank)
+                        try:
+                            with open(path, "a", encoding="utf-8") as f:
+                                f.write(
+                                    f"{datetime.now().isoformat()} pid={os.getpid()} rank={rank} "
+                                    f"tag=trainer_no_sync_decision i={i} last={len(batch_samples)-1} "
+                                    f"args_gc={getattr(args, 'gradient_checkpointing', False)} model_gc={model_gc_enabled} "
+                                    f"disable_no_sync={disable_no_sync} dist_type={self.accelerator.distributed_type}\n"
+                                )
+                        except Exception:
+                            pass
+                        self._kt_no_sync_debug_count = getattr(self, "_kt_no_sync_debug_count", 0) + 1
+
                     context = (
                         functools.partial(self.accelerator.no_sync, model=model)
                         if i != len(batch_samples) - 1
                         and self.accelerator.distributed_type != DistributedType.DEEPSPEED
+                        and not disable_no_sync
                         else contextlib.nullcontext
                     )
                     with context():
@@ -2687,11 +2969,138 @@ class Trainer:
                             )
                         tr_loss = tr_loss + tr_loss_step
 
-                    self.current_flos += float(self.floating_point_ops(inputs))
+                    if self.is_kt_enabled:
+                        # Cache floating_point_ops per token: the underlying num_parameters()
+                        # traverses all modules twice (~1.5s for MoE models) but the result is constant.
+                        if not hasattr(self, "_cached_flos_params"):
+                            unwrapped = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+                            if hasattr(unwrapped, "num_parameters") and hasattr(unwrapped, "estimate_tokens"):
+                                self._cached_flos_params = (unwrapped.num_parameters(exclude_embeddings=True), unwrapped)
+                            else:
+                                self._cached_flos_params = None
+                        if self._cached_flos_params is not None:
+                            num_params, unwrapped_model = self._cached_flos_params
+                            self.current_flos += float(6 * unwrapped_model.estimate_tokens(inputs) * num_params)
+                        else:
+                            self.current_flos += float(self.floating_point_ops(inputs))
+                    else:
+                        self.current_flos += float(self.floating_point_ops(inputs))
 
                     if do_sync_step:
                         # Since we perform prefetching, we need to manually set sync_gradients to True
                         self.accelerator.gradient_state._set_sync_gradients(True)
+
+                        if self.is_kt_enabled and not getattr(self, "_kt_optim_device_debug_printed", False):
+                            self._kt_optim_device_debug_printed = True
+                            try:
+                                raw_opt = self.optimizer
+                                unwrap_chain = [raw_opt.__class__.__name__]
+                                while hasattr(raw_opt, "optimizer"):
+                                    raw_opt = raw_opt.optimizer
+                                    unwrap_chain.append(raw_opt.__class__.__name__)
+
+                                device_dtype_counts = {}
+                                grad_device_dtype_counts = {}
+                                device_numel = {}
+                                grad_device_numel = {}
+                                num_params_total = 0
+                                num_params_with_grad = 0
+                                num_params_requires_grad = 0
+                                param_device_mismatch = 0
+
+                                top_cpu_params = []
+                                top_cuda_params = []
+
+                                for group_idx, group in enumerate(getattr(raw_opt, "param_groups", [])):
+                                    for p in group.get("params", []):
+                                        if p is None:
+                                            continue
+                                        num_params_total += 1
+                                        if getattr(p, "requires_grad", False):
+                                            num_params_requires_grad += 1
+                                        dev = getattr(p, "device", None)
+                                        dt = getattr(p, "dtype", None)
+                                        key = (str(dev), str(dt))
+                                        device_dtype_counts[key] = device_dtype_counts.get(key, 0) + 1
+                                        try:
+                                            n = int(p.numel())
+                                        except Exception:
+                                            n = 0
+                                        device_numel[str(dev)] = device_numel.get(str(dev), 0) + n
+
+                                        if str(dev).startswith("cpu"):
+                                            top_cpu_params.append((n, group_idx, tuple(p.shape), str(dt)))
+                                        elif str(dev).startswith("cuda"):
+                                            top_cuda_params.append((n, group_idx, tuple(p.shape), str(dt)))
+
+                                        g = getattr(p, "grad", None)
+                                        if g is not None:
+                                            num_params_with_grad += 1
+                                            gdev = getattr(g, "device", None)
+                                            gdt = getattr(g, "dtype", None)
+                                            gkey = (str(gdev), str(gdt))
+                                            grad_device_dtype_counts[gkey] = grad_device_dtype_counts.get(gkey, 0) + 1
+                                            try:
+                                                gn = int(g.numel())
+                                            except Exception:
+                                                gn = 0
+                                            grad_device_numel[str(gdev)] = grad_device_numel.get(str(gdev), 0) + gn
+                                            if dev is not None and gdev is not None and dev != gdev:
+                                                param_device_mismatch += 1
+
+                                top_cpu_params.sort(reverse=True)
+                                top_cuda_params.sort(reverse=True)
+
+                                logger.info(
+                                    "[KT DEBUG] Optimizer chain=%s torch=%s cuda=%s",
+                                    " -> ".join(unwrap_chain),
+                                    getattr(torch, "__version__", "unknown"),
+                                    getattr(torch.version, "cuda", "unknown"),
+                                )
+                                logger.info(
+                                    "[KT DEBUG] torch cpu_threads=%d interop_threads=%d OMP_NUM_THREADS=%s MKL_NUM_THREADS=%s",
+                                    torch.get_num_threads(),
+                                    torch.get_num_interop_threads(),
+                                    os.environ.get("OMP_NUM_THREADS", None),
+                                    os.environ.get("MKL_NUM_THREADS", None),
+                                )
+                                logger.info(
+                                    "[KT DEBUG] Optimizer groups=%d params_total=%d requires_grad=%d with_grad=%d grad_device_mismatch=%d",
+                                    len(getattr(raw_opt, "param_groups", [])),
+                                    num_params_total,
+                                    num_params_requires_grad,
+                                    num_params_with_grad,
+                                    param_device_mismatch,
+                                )
+
+                                for i, group in enumerate(getattr(raw_opt, "param_groups", [])):
+                                    logger.info(
+                                        "[KT DEBUG] group[%d] lr=%s wd=%s betas=%s eps=%s fused=%s foreach=%s capturable=%s differentiable=%s",
+                                        i,
+                                        group.get("lr", None),
+                                        group.get("weight_decay", None),
+                                        group.get("betas", None),
+                                        group.get("eps", None),
+                                        group.get("fused", None),
+                                        group.get("foreach", None),
+                                        group.get("capturable", None),
+                                        group.get("differentiable", None),
+                                    )
+
+                                logger.info("[KT DEBUG] Param (device,dtype)->count: %s", dict(sorted(device_dtype_counts.items())))
+                                logger.info("[KT DEBUG] Param device->numel: %s", dict(sorted(device_numel.items())))
+                                logger.info(
+                                    "[KT DEBUG] Grad (device,dtype)->count: %s", dict(sorted(grad_device_dtype_counts.items()))
+                                )
+                                logger.info("[KT DEBUG] Grad device->numel: %s", dict(sorted(grad_device_numel.items())))
+                                logger.info(
+                                    "[KT DEBUG] Top CPU params (numel,group,shape,dtype): %s", top_cpu_params[:10]
+                                )
+                                logger.info(
+                                    "[KT DEBUG] Top CUDA params (numel,group,shape,dtype): %s", top_cuda_params[:10]
+                                )
+                            except Exception as e:
+                                logger.info("[KT DEBUG] Optimizer device breakdown failed: %s", e)
 
                         # Gradient clipping
                         if args.max_grad_norm is not None and args.max_grad_norm > 0:
@@ -2706,16 +3115,185 @@ class Trainer:
                                     args.max_grad_norm,
                                 )
                             else:
-                                grad_norm_context = contextlib.nullcontext
-                                if self.is_tp_enabled:
-                                    from torch.distributed._tensor.experimental import implicit_replication
+                                if self.is_kt_enabled and not self.is_fsdp_enabled:
+                                    raw_opt = self.optimizer
+                                    while hasattr(raw_opt, "optimizer"):
+                                        raw_opt = raw_opt.optimizer
 
-                                    grad_norm_context = implicit_replication
-                                with grad_norm_context():
+                                    cpu_params, cuda_params, other_params = [], [], []
+                                    seen_param_ids = set()
+                                    for group in getattr(raw_opt, "param_groups", []):
+                                        for p in group.get("params", []):
+                                            if p is None:
+                                                continue
+                                            pid = id(p)
+                                            if pid in seen_param_ids:
+                                                continue
+                                            seen_param_ids.add(pid)
+                                            if not getattr(p, "requires_grad", False):
+                                                continue
+                                            device_type = getattr(getattr(p, "device", None), "type", None)
+                                            if device_type == "cpu":
+                                                cpu_params.append(p)
+                                            elif device_type == "cuda":
+                                                cuda_params.append(p)
+                                            else:
+                                                other_params.append(p)
+                                    if not hasattr(self, "_kt_clip_param_source_debug_printed"):
+                                        self._kt_clip_param_source_debug_printed = True
+                                        logger.info(
+                                            "[KT DEBUG] clip source=optimizer cpu_params=%d cuda_params=%d other_params=%d",
+                                            len(cpu_params),
+                                            len(cuda_params),
+                                            len(other_params),
+                                        )
+
+                                    self.accelerator.unscale_gradients()
+                                    from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype
+                                    import torch.distributed as dist
+
+                                    total_norm_sq = 0.0
+                                    gpu_grad_buckets = []
+                                    cpu_grad_buckets = []
+
+                                    # GPU/other params: grads are DDP-synced, identical on all ranks
+                                    for params in (cuda_params, other_params):
+                                        grads = [p.grad for p in params if p.grad is not None]
+                                        if not grads:
+                                            continue
+                                        grouped = _group_tensors_by_device_and_dtype([grads])
+                                        for (_, _), ([device_grads], _) in grouped.items():
+                                            if not device_grads:
+                                                continue
+                                            device_norms = torch._foreach_norm(device_grads, 2)
+                                            norm_device_type = getattr(getattr(device_grads[0], "device", None), "type", None)
+                                            if norm_device_type == "cuda":
+                                                total_norm_sq += float(torch.stack(device_norms).square().sum())
+                                            else:
+                                                total_norm_sq += sum(float(n) ** 2 for n in device_norms)
+                                            gpu_grad_buckets.append(device_grads)
+
+                                    # CPU params (KT LoRA): only rank 0 has grads from KT backward.
+                                    # Broadcast just the scalar norm² so all ranks compute the same clip_coef.
+                                    kt_norm_sq = torch.tensor(0.0)
+                                    cpu_grads = [p.grad for p in cpu_params if p.grad is not None]
+                                    if cpu_grads:
+                                        norms = torch._foreach_norm(cpu_grads, 2)
+                                        kt_norm_sq = torch.tensor(sum(float(n) ** 2 for n in norms))
+                                        cpu_grad_buckets.append(cpu_grads)
+                                    if dist.is_initialized() and dist.get_world_size() > 1:
+                                        dist.broadcast(kt_norm_sq, src=0)
+                                    total_norm_sq += float(kt_norm_sq)
+
+                                    total_norm = total_norm_sq**0.5
+                                    _grad_norm = total_norm
+
+                                    if total_norm > args.max_grad_norm:
+                                        clip_coef = args.max_grad_norm / (total_norm + 1e-6)
+                                        for device_grads in gpu_grad_buckets:
+                                            torch._foreach_mul_(device_grads, clip_coef)
+                                        # Only rank 0 has KT LoRA grads to clip
+                                        for device_grads in cpu_grad_buckets:
+                                            torch._foreach_mul_(device_grads, clip_coef)
+                                elif not (self.is_fsdp_enabled and self.is_kt_enabled):
+                                    if (
+                                        not hasattr(self, "_cached_clip_grad_norm_params")
+                                        or self._cached_clip_grad_norm_params[0] is not model
+                                    ):
+                                        self._cached_clip_grad_norm_params = (
+                                            model,
+                                            [p for p in model.parameters() if p.requires_grad],
+                                        )
                                     _grad_norm = self.accelerator.clip_grad_norm_(
-                                        model.parameters(),
-                                        args.max_grad_norm,
+                                        self._cached_clip_grad_norm_params[1], args.max_grad_norm
                                     )
+                                else:
+                                    grad_norm_context = contextlib.nullcontext
+                                    if self.is_tp_enabled:
+                                        from torch.distributed._tensor.experimental import implicit_replication
+
+                                        grad_norm_context = implicit_replication
+                                    from torch.distributed.tensor import DTensor
+                                    import torch.distributed as dist
+                                    with grad_norm_context():
+                                        # Cache parameter classification to avoid traversing
+                                        # all modules every step (~1.6s for large MoE models).
+                                        if not hasattr(self, "_cached_grad_params"):
+                                            dt_params, t_params_cpu, t_params_gpu = [], [], []
+                                            # Use fused KT buffer params (~348) instead of
+                                            # 89k individual view params for CPU LoRA.
+                                            kt_fused = getattr(self, "_kt_fused_optimizer_params", None)
+                                            if kt_fused:
+                                                t_params_cpu = list(kt_fused)
+                                                for p in model.parameters():
+                                                    if p.requires_grad:
+                                                        if isinstance(p, DTensor):
+                                                            dt_params.append(p)
+                                                        elif getattr(p.device, "type", None) != "cpu":
+                                                            t_params_gpu.append(p)
+                                            else:
+                                                for p in model.parameters():
+                                                    if p.requires_grad:
+                                                        if isinstance(p, DTensor):
+                                                            dt_params.append(p)
+                                                        elif getattr(p.device, "type", None) == "cpu":
+                                                            t_params_cpu.append(p)
+                                                        else:
+                                                            t_params_gpu.append(p)
+                                            self._cached_grad_params = (dt_params, t_params_cpu, t_params_gpu)
+                                        dt_params, t_params_cpu, t_params_gpu = self._cached_grad_params
+
+                                        from torch.utils._foreach_utils import _group_tensors_by_device_and_dtype
+
+                                        # GPU plain tensors: grads are FSDP/DDP-synced, identical on all ranks
+                                        t_gpu_grads = [p.grad for p in t_params_gpu if p.grad is not None]
+                                        t_total_norm_sq = 0.0
+                                        t_gpu_grad_buckets = []
+                                        if t_gpu_grads:
+                                            grouped = _group_tensors_by_device_and_dtype([t_gpu_grads])
+                                            for (device, _), ([device_grads], _) in grouped.items():
+                                                device_norms = torch._foreach_norm(device_grads, 2)
+                                                if device.type == "cuda":
+                                                    t_total_norm_sq += float(torch.stack(device_norms).square().sum())
+                                                else:
+                                                    t_total_norm_sq += sum(float(n) ** 2 for n in device_norms)
+                                                t_gpu_grad_buckets.append(device_grads)
+
+                                        # CPU plain tensors (KT LoRA): only rank 0 has grads.
+                                        # Broadcast just the scalar norm² so all ranks compute the same clip_coef.
+                                        kt_norm_sq = torch.tensor(0.0)
+                                        t_cpu_grads = [p.grad for p in t_params_cpu if p.grad is not None]
+                                        if t_cpu_grads:
+                                            norms = torch._foreach_norm(t_cpu_grads, 2)
+                                            kt_norm_sq = torch.tensor(sum(float(n) ** 2 for n in norms))
+                                        if dist.is_initialized() and dist.get_world_size() > 1:
+                                            dist.broadcast(kt_norm_sq, src=0)
+                                        t_total_norm_sq += float(kt_norm_sq)
+
+                                        # Collect grads for convenience
+                                        dt_with_grad = [p for p in dt_params if p.grad is not None]
+
+                                        # Compute DTensor grad norm (without clipping)
+                                        if dt_with_grad:
+                                            dt_norm = float(torch.nn.utils.clip_grad_norm_(dt_with_grad, float('inf')))
+                                        else:
+                                            dt_norm = 0.0
+
+                                        total_norm = (dt_norm ** 2 + t_total_norm_sq) ** 0.5
+                                        _grad_norm = total_norm
+
+                                        if total_norm > args.max_grad_norm:
+                                            clip_coef = args.max_grad_norm / (total_norm + 1e-6)
+                                            # Clip GPU plain tensors (foreach-batched, grouped by device)
+                                            for device_grads in t_gpu_grad_buckets:
+                                                torch._foreach_mul_(device_grads, clip_coef)
+                                            # Clip CPU plain tensors (KT LoRA) — only rank 0 has them
+                                            if t_cpu_grads:
+                                                torch._foreach_mul_(t_cpu_grads, clip_coef)
+                                            # Clip DTensors via their local tensors (foreach-batched)
+                                            if dt_with_grad:
+                                                dt_local_grads = [p.grad._local_tensor for p in dt_with_grad]
+                                                torch._foreach_mul_(dt_local_grads, clip_coef)
 
                             if (
                                 is_accelerate_available()
@@ -2730,6 +3308,25 @@ class Trainer:
 
                         self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
 
+                        # KT LoRA gradients are broadcast above (before clipping).
+
+                        # # One-time optimizer check for KT LoRA params
+                        # if self.is_kt_enabled and not getattr(self, '_kt_opt_checked', False):
+                        #     self._kt_opt_checked = True
+                        #     kt_m = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+                        #     kt_ps = get_kt_lora_params(kt_m) if get_kt_lora_params else []
+                        #     raw_opt = self.optimizer.optimizer if hasattr(self.optimizer, 'optimizer') else self.optimizer
+                        #     opt_ids = {id(p) for g in raw_opt.param_groups for p in g['params']}
+                        #     found = sum(1 for p in kt_ps if id(p) in opt_ids)
+                        #     for p in kt_ps:
+                        #         g = p.grad
+                        #         print(f"[KT OPT CHECK] id={id(p)} in_opt={id(p) in opt_ids} "
+                        #               f"grad={'%.6f'%g.float().norm().item() if g is not None else 'None'} "
+                        #               f"data_norm={p.data.float().norm().item():.6f} shape={tuple(p.shape)}", flush=True)
+                        #     print(f"[KT OPT CHECK] {found}/{len(kt_ps)} KT LoRA params in optimizer, "
+                        #           f"total opt params={sum(len(g['params']) for g in raw_opt.param_groups)}, "
+                        #           f"num_groups={len(raw_opt.param_groups)}", flush=True)
+
                         context = contextlib.nullcontext
                         if self.is_tp_enabled:
                             from torch.distributed._tensor.experimental import implicit_replication
@@ -2738,6 +3335,41 @@ class Trainer:
 
                         with context():
                             self.optimizer.step()
+
+                        # # Check if optimizer.step() actually updated KT LoRA B params
+                        # if self.is_kt_enabled and getattr(self, '_kt_step_count', 0) < 5:
+                        #     self._kt_step_count = getattr(self, '_kt_step_count', 0) + 1
+                        #     step_n = self._kt_step_count
+                        #     kt_m = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+                        #     kt_ps = get_kt_lora_params(kt_m) if get_kt_lora_params else []
+                        #     raw_opt = self.optimizer.optimizer if hasattr(self.optimizer, 'optimizer') else self.optimizer
+                        #     b_example = None
+                        #     a_example = None
+                        #     b_zero_count = 0
+                        #     b_total = 0
+                        #     for p in kt_ps:
+                        #         is_b = (len(p.shape) == 3 and p.shape[-1] <= 16)
+                        #         if is_b:
+                        #             b_total += 1
+                        #             if p.data.float().norm().item() == 0:
+                        #                 b_zero_count += 1
+                        #             if b_example is None:
+                        #                 b_example = p
+                        #         elif a_example is None:
+                        #             a_example = p
+                        #     lr = raw_opt.param_groups[-1].get('lr', -1)
+                        #     b_state = raw_opt.state.get(b_example, {}) if b_example is not None else {}
+                        #     b_step = b_state.get('step', 'N/A')
+                        #     b_grad = b_example.grad.float().norm().item() if b_example is not None and b_example.grad is not None else -1
+                        #     b_norm = b_example.data.float().norm().item() if b_example is not None else -1
+                        #     a_norm = a_example.data.float().norm().item() if a_example is not None else -1
+                        #     a_grad = a_example.grad.float().norm().item() if a_example is not None and a_example.grad is not None else -1
+                        #     print(f"[KT STEP {step_n}] lr={lr:.2e} B: {b_zero_count}/{b_total} still_zero "
+                        #           f"b_norm={b_norm:.6f} b_grad={b_grad:.6f} b_opt_step={b_step} | "
+                        #           f"A: a_norm={a_norm:.6f} a_grad={a_grad:.6f}", flush=True)
+
+                        if self.is_kt_enabled:
+                            update_kt_lora_pointers(model)
 
                         self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
@@ -2749,10 +3381,15 @@ class Trainer:
                             if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                                 self.lr_scheduler.step()
 
-                        model.zero_grad()
                         self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1) / steps_in_epoch
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        if self.is_kt_enabled:
+                            # Use optimizer.zero_grad() instead of model.zero_grad() to avoid
+                            # traversing all modules of the large MoE model (expensive Python overhead).
+                            self.optimizer.zero_grad(set_to_none=False)
+                        else:
+                            model.zero_grad()
                         self._maybe_log_save_evaluate(
                             tr_loss,
                             grad_norm,
@@ -3464,9 +4101,15 @@ class Trainer:
             save_fsdp_model(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **_get_fsdp_ckpt_kwargs()
             )
-            save_fsdp_optimizer(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
-            )
+            # When KT is enabled, KT LoRA params are not managed by FSDP, so we can't use
+            # save_fsdp_optimizer (it fails to map KT LoRA params). Use regular torch.save instead.
+            if self.is_kt_enabled:
+                if self.args.should_save:
+                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            else:
+                save_fsdp_optimizer(
+                    self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
+                )
         elif self.args.should_save:
             # deepspeed.save_checkpoint above saves model/optim/sched
             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
@@ -3576,7 +4219,7 @@ class Trainer:
                     # In distributed training however, we load directly on each GPU and risk the GPU OOM as it's more
                     # likely to get OOM on CPU (since we load num_gpu times the optimizer state
                     map_location = self.args.device if self.args.world_size > 1 else "cpu"
-                    if self.is_fsdp_enabled:
+                    if self.is_fsdp_enabled and not self.is_kt_enabled:
                         load_fsdp_optimizer(
                             self.accelerator.state.fsdp_plugin,
                             self.accelerator,
@@ -4007,7 +4650,11 @@ class Trainer:
 
         # Context manager is no-op if CP isn't enabled
         with cp_context():
-            model.train()
+            if not self.is_kt_enabled or not model.training:
+                # Skip redundant model.train() for KT MoE models when already in train mode.
+                # nn.Module.train() recursively visits all submodules (~800+ for MoE) and sets
+                # self.training = True via __setattr__, costing ~2s per step.
+                model.train()
             if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
                 self.optimizer.train()
 
@@ -4204,9 +4851,43 @@ class Trainer:
             self._save(output_dir)
         elif self.is_fsdp_enabled:
             if "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
-                state_dict = self.accelerator.get_state_dict(self.model)
-                if self.args.should_save:
-                    self._save(output_dir, state_dict=state_dict)
+                if self.is_kt_enabled:
+                    # KT + FSDP2: use FSDP2 state dict to gather sharded PEFT adapter
+                    # weights, then save only the adapter + KT MoE LoRA.
+                    from torch.distributed.checkpoint.state_dict import get_model_state_dict, StateDictOptions
+                    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                    state_dict = get_model_state_dict(self.model, options=options)
+                    if self.args.should_save:
+                        unwrapped = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+                        os.makedirs(output_dir, exist_ok=True)
+                        # Filter to only trainable (adapter) parameters
+                        trainable_keys = {
+                            name for name, p in unwrapped.named_parameters() if p.requires_grad
+                        }
+                        adapter_state = {k: v for k, v in state_dict.items() if k in trainable_keys}
+                        # Split: PEFT saves its own keys, lora_experts saved separately
+                        le_state = {k: v for k, v in adapter_state.items() if "lora_experts" in k}
+                        peft_state = {k: v for k, v in adapter_state.items() if "lora_experts" not in k}
+
+                        if isinstance(unwrapped, PeftModel):
+                            unwrapped.save_pretrained(
+                                output_dir,
+                                state_dict=peft_state,
+                                safe_serialization=self.args.save_safetensors,
+                            )
+                        # Append lora_experts into the adapter file saved by PEFT
+                        if le_state:
+                            from safetensors.torch import save_file as _save_file
+                            le_file = os.path.join(output_dir, "lora_experts.safetensors")
+                            _save_file(le_state, le_file, metadata={"format": "pt"})
+                            logger.info(f"[KT] Saved {len(le_state)} lora_experts tensors to {le_file}")
+                        if self.processing_class is not None:
+                            self.processing_class.save_pretrained(output_dir)
+                        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+                else:
+                    state_dict = self.accelerator.get_state_dict(self.model)
+                    if self.args.should_save:
+                        self._save(output_dir, state_dict=state_dict)
         elif self.is_deepspeed_enabled:
             try:
                 state_dict = self.accelerator.get_state_dict(self.deepspeed)
@@ -4344,6 +5025,12 @@ class Trainer:
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+        print(f"[trainer save] is_kt_enabled={self.is_kt_enabled}, should_save={self.args.should_save}", flush=True)
+        if self.is_kt_enabled and self.args.should_save:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            print(f"[trainer save] unwrapped model type={type(kt_model).__name__}, calling save_kt_moe_to_adapter", flush=True)
+            save_kt_moe_to_adapter(kt_model, output_dir)
 
     def store_flos(self):
         # Storing the number of floating-point operations that went into the model
@@ -5457,6 +6144,7 @@ class Trainer:
                 self.args.gradient_accumulation_steps = grad_acc_kwargs["num_steps"]
 
         accelerator_config = self.args.accelerator_config.to_dict()
+        kt_config_dict = accelerator_config.pop("kt_config", None)
 
         if is_accelerate_available("0.28.0"):
             # Extract dataloader config params from accelerator config
@@ -5485,6 +6173,22 @@ class Trainer:
         args = {
             "deepspeed_plugin": self.args.deepspeed_plugin,
         }
+        if kt_config_dict is not None:
+            if not _accelerate_supports_kt_config:
+                raise ImportError(
+                    "The installed `accelerate` version does not support `kt_config`. "
+                    "Please upgrade `accelerate` or remove `kt_config` from `accelerator_config`."
+                )
+            if KTransformersPlugin is None:
+                raise ImportError(
+                    "KTransformersPlugin could not be imported from `accelerate`. Please upgrade to a version that includes it."
+                )
+            if isinstance(kt_config_dict, dict):
+                args["kt_config"] = KTransformersPlugin(**kt_config_dict)
+            elif isinstance(kt_config_dict, KTransformersPlugin):
+                args["kt_config"] = kt_config_dict
+            else:
+                raise TypeError("`kt_config` must be a dict or KTransformersPlugin instance.")
 
         # We defer compatibility checks to accelerator
         if self.args.parallelism_config is not None:
@@ -5503,10 +6207,12 @@ class Trainer:
         # args should be prepared here
         if hasattr(self.model, "tp_size") and self.model.tp_size is not None and self.model.tp_size > 1:
             self.is_tp_enabled = True
-            if version.parse(accelerate_version) > version.parse("1.3.0"):
-                args["torch_tp_plugin"] = TorchTensorParallelPlugin(tp_size=self.model.tp_size)
-            else:
-                raise ValueError("Requires accelerate>1.3.0 to use Tensor Parallelism.")
+            # Skip if parallelism_config already handles TP (native TP was applied during from_pretrained)
+            if "parallelism_config" not in args or args["parallelism_config"] is None:
+                if version.parse(accelerate_version) > version.parse("1.3.0"):
+                    args["torch_tp_plugin"] = TorchTensorParallelPlugin(tp_size=self.model.tp_size)
+                else:
+                    raise ValueError("Requires accelerate>1.3.0 to use Tensor Parallelism.")
 
         # create accelerator object
         self.accelerator = Accelerator(**args)
@@ -5521,7 +6227,12 @@ class Trainer:
         # deepspeed and accelerate flags covering both trainer args and accelerate launcher
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
-        self.is_tp_enabled = getattr(self.accelerator.state, "torch_tp_plugin", None) is not None
+        self.is_tp_enabled = (
+            getattr(self.accelerator.state, "torch_tp_plugin", None) is not None
+            or (getattr(self.accelerator, "parallelism_config", None) is not None
+                and self.accelerator.parallelism_config.tp_enabled)
+        )
+        self.is_kt_enabled = _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
         # post accelerator creation setup
         if self.is_fsdp_enabled:
             fsdp_plugin = self.accelerator.state.fsdp_plugin
