@@ -32,7 +32,7 @@ class HfTrainerKTConfig:
     """
 
     # Mapping from kt_config dict keys to ACCELERATE_KT_* environment variables.
-    # Used to populate missing config values from env vars set by `accelerate launch`.
+    # Dict keys use kt_ prefix, matching KTConfig field names exactly.
     _ENV_MAPPING: dict[str, tuple[str, type]] = {
         "kt_backend": ("ACCELERATE_KT_BACKEND", str),
         "kt_num_gpu_experts": ("ACCELERATE_KT_NUM_GPU_EXPERTS", int),
@@ -44,10 +44,11 @@ class HfTrainerKTConfig:
         "kt_use_lora_experts": ("ACCELERATE_KT_USE_LORA_EXPERTS", bool),
         "kt_lora_expert_num": ("ACCELERATE_KT_LORA_EXPERT_NUM", int),
         "kt_lora_expert_intermediate_size": ("ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE", int),
-        "lora_rank": ("ACCELERATE_KT_LORA_RANK", int),
-        "lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
-        "model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
+        "kt_lora_rank": ("ACCELERATE_KT_LORA_RANK", int),
+        "kt_lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
+        "kt_model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
         "kt_skip_expert_loading": ("ACCELERATE_KT_SKIP_EXPERT_LOADING", bool),
+        "kt_share_cache_pool": ("ACCELERATE_KT_SHARE_CACHE_POOL", bool),
     }
 
     def __init__(self, kt_config_dict: Any | None):
