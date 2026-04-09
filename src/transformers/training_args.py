@@ -1838,8 +1838,6 @@ class TrainingArguments:
         if isinstance(kt_config_dict, dict):
             kt_config_dict.setdefault("enabled", True)
             kt_config_dict.setdefault("kt_skip_expert_loading", True)
-            if self.gradient_checkpointing:
-                kt_config_dict.setdefault("kt_share_cache_pool", True)
 
         if kt_config_dict is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
             if not is_accelerate_available():
@@ -1850,6 +1848,7 @@ class TrainingArguments:
 
             # Keep a strong reference on `TrainingArguments` so the weakref stays alive.
             self.hf_kt_config = HfTrainerKTConfig(kt_config_dict)
+            self.hf_kt_config.trainer_config_process(self)
             if getattr(self.hf_kt_config, "enabled", False):
                 os.environ["ACCELERATE_USE_KT"] = "true"
 

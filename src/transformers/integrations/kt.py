@@ -48,7 +48,6 @@ class HfTrainerKTConfig:
         "kt_lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
         "kt_model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
         "kt_skip_expert_loading": ("ACCELERATE_KT_SKIP_EXPERT_LOADING", bool),
-        "kt_share_cache_pool": ("ACCELERATE_KT_SHARE_CACHE_POOL", bool),
     }
 
     def __init__(self, kt_config_dict: Any | None):
@@ -96,6 +95,11 @@ class HfTrainerKTConfig:
         if hasattr(cfg, name):
             return getattr(cfg, name)
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+    def trainer_config_process(self, args):
+        """Adjust kt_config with TrainingArguments values, similar to DeepSpeed's trainer_config_process."""
+        if getattr(args, "gradient_checkpointing", False):
+            self._kt_config.setdefault("kt_share_cache_pool", True)
 
     @property
     def enabled(self) -> bool:
