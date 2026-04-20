@@ -765,6 +765,7 @@ class TrainingArguments:
         "accelerator_config",
         "fsdp_config",
         "deepspeed",
+        "kt_config",
         "gradient_checkpointing_kwargs",
         "lr_scheduler_kwargs",
     ]
@@ -1411,6 +1412,17 @@ class TrainingArguments:
         metadata={"help": "Enable DeepSpeed integration. Value is a path to a JSON config file or a dict."},
     )
 
+    # --- KTransformers ---
+    kt_config: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable KTransformers and pass a KT config dict or path to a json config file. "
+                "KTransformers accelerates MoE models using CPU AMX instructions."
+            )
+        },
+    )
+
     # --- Debugging ---
     debug: str | list[DebugOption] = field(
         default="",
@@ -1663,6 +1675,41 @@ class TrainingArguments:
             self.deepspeed_plugin = DeepSpeedPlugin()
             self.deepspeed_plugin.set_mixed_precision(self.mixed_precision)
             self.deepspeed_plugin.set_deepspeed_weakref()
+
+        # ── 13. KTransformers ──
+        # Priority: self.kt_config > accelerator_config.kt_config > ACCELERATE_USE_KT env var
+        kt_config_dict = None
+        if self.kt_config is not None:
+            if isinstance(self.kt_config, str):
+                import json
+
+                with open(self.kt_config, "r") as f:
+                    kt_config_dict = json.load(f)
+            else:
+                kt_config_dict = self.kt_config
+
+        if kt_config_dict is None and is_accelerate_available() and self.accelerator_config is not None:
+            kt_config_dict = getattr(self.accelerator_config, "kt_config", None)
+
+        if isinstance(kt_config_dict, dict):
+            kt_config_dict.setdefault("enabled", True)
+            kt_config_dict.setdefault("kt_skip_expert_loading", True)
+
+        if kt_config_dict is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
+            if not is_accelerate_available():
+                raise ValueError(
+                    f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`."
+                )
+            from .integrations.kt import HfTrainerKTConfig
+
+            # Keep a strong reference on `TrainingArguments` so the weakref stays alive.
+            self.hf_kt_config = HfTrainerKTConfig(kt_config_dict)
+            self.hf_kt_config.trainer_config_process(self)
+            if getattr(self.hf_kt_config, "enabled", False):
+                os.environ["ACCELERATE_USE_KT"] = "true"
+
+            if self.accelerator_config is not None and kt_config_dict is not None:
+                self.accelerator_config.kt_config = kt_config_dict
 
     def _validate_args(self):
         """Validate argument combinations and value constraints."""

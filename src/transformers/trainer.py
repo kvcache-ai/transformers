@@ -210,6 +210,8 @@ if is_sagemaker_mp_enabled():
 if is_peft_available():
     from peft import PeftModel
 
+_accelerate_supports_kt_config = False
+
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches
     from accelerate.state import AcceleratorState
@@ -228,6 +230,25 @@ if is_accelerate_available():
 
     if is_deepspeed_available():
         from accelerate.utils import DeepSpeedSchedulerWrapper
+
+    try:
+        from accelerate.utils import KTransformersPlugin
+
+        _accelerate_supports_kt_config = "kt_config" in inspect.signature(Accelerator).parameters
+    except ImportError:
+        KTransformersPlugin = None
+        _accelerate_supports_kt_config = False
+
+    try:
+        from kt_kernel.sft import (
+            get_kt_lora_params,
+            kt_adapt_peft_lora,
+            load_kt_moe_from_adapter,
+            save_kt_moe_to_adapter,
+            update_kt_lora_pointers,
+        )
+    except ImportError:
+        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = update_kt_lora_pointers = None
 
 
 if TYPE_CHECKING:
@@ -745,6 +766,25 @@ class Trainer:
             )
             args["dynamo_plugin"] = dynamo_plugin
 
+        # KT plugin: forward kt_config from AcceleratorConfig to Accelerator
+        kt_config_dict = self.args.accelerator_config.kt_config if hasattr(self.args.accelerator_config, "kt_config") else None
+        if kt_config_dict is not None:
+            if not _accelerate_supports_kt_config:
+                raise ImportError(
+                    "The installed `accelerate` version does not support `kt_config`. "
+                    "Please upgrade `accelerate` or remove `kt_config` from `accelerator_config`."
+                )
+            if KTransformersPlugin is None:
+                raise ImportError(
+                    "KTransformersPlugin could not be imported from `accelerate`. Please upgrade to a version that includes it."
+                )
+            if isinstance(kt_config_dict, dict):
+                args["kt_config"] = KTransformersPlugin(**kt_config_dict)
+            elif isinstance(kt_config_dict, KTransformersPlugin):
+                args["kt_config"] = kt_config_dict
+            else:
+                raise TypeError("`kt_config` must be a dict or KTransformersPlugin instance.")
+
         return args
 
     def create_accelerator_and_postprocess(self) -> None:
@@ -774,6 +814,7 @@ class Trainer:
         gradient_accumulation_plugin = GradientAccumulationPlugin(**grad_acc_kwargs)
 
         accelerator_config = self.args.accelerator_config.to_dict()
+        accelerator_config.pop("kt_config", None)
 
         # Extract dataloader config params from accelerator config
         dataloader_params = ["split_batches", "dispatch_batches", "even_batches", "use_seedable_sampler"]
@@ -817,6 +858,7 @@ class Trainer:
         # deepspeed and accelerate flags covering both trainer args and accelerate launcher
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.is_kt_enabled = _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
 
         # post accelerator creation setup
         if self.is_fsdp_enabled:
@@ -1495,7 +1537,11 @@ class Trainer:
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
 
-        model.zero_grad()
+        if self.is_kt_enabled:
+            # Keep KT LoRA grad views alive (avoid set_to_none=True clearing them).
+            self.optimizer.zero_grad(set_to_none=False)
+        else:
+            model.zero_grad()
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
@@ -1632,6 +1678,27 @@ class Trainer:
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             train_dataloader = self.accelerator.deepspeed_ulysses_dl_adapter(train_dataloader, model)
 
+        # KT LoRA adaptation: MUST happen AFTER all prepare() calls.
+        # FSDP2's prepare does model.to(meta) + load_state_dict(assign=True) which
+        # creates new param objects and destroys any .grad views set earlier.
+        kt_model = None
+        if self.is_kt_enabled:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+
+        if kt_model is not None and kt_adapt_peft_lora is not None:
+            kt_adapt_peft_lora(kt_model)
+
+            # Inject fused expert LoRA params into existing optimizer's last param group
+            # (cannot use add_param_group — lr_scheduler is already created with fixed group count)
+            if self.optimizer is not None and get_kt_lora_params is not None:
+                kt_lora_params = get_kt_lora_params(kt_model)
+                if kt_lora_params:
+                    existing_ids = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
+                    new_params = [p for p in kt_lora_params if id(p) not in existing_ids]
+                    if new_params:
+                        self.optimizer.param_groups[-1]["params"].extend(new_params)
+                        logger.info(f"Injected {len(new_params)} fused expert LoRA params into optimizer")
+
         # load checkpoint
         if resume_from_checkpoint is not None:
             if self.is_deepspeed_enabled:
@@ -1643,6 +1710,9 @@ class Trainer:
 
             self._load_optimizer_and_scheduler(resume_from_checkpoint)
             self._load_scaler(resume_from_checkpoint)
+
+            if kt_model is not None and load_kt_moe_from_adapter is not None:
+                load_kt_moe_from_adapter(kt_model, resume_from_checkpoint)
 
         # Update the references for the callback_handler
         for attr in ("model", "optimizer", "lr_scheduler"):
@@ -1759,6 +1829,8 @@ class Trainer:
 
                     self.control = self.callback_handler.on_pre_optimizer_step(self.args, self.state, self.control)
                     self.optimizer.step()
+                    if self.is_kt_enabled and update_kt_lora_pointers is not None:
+                        update_kt_lora_pointers(model)
                     self.control = self.callback_handler.on_optimizer_step(self.args, self.state, self.control)
 
                     # get leaning rate before update
@@ -1769,7 +1841,11 @@ class Trainer:
                         if not isinstance(self.lr_scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau, GreedyLR)):
                             self.lr_scheduler.step()
 
-                    model.zero_grad()
+                    if self.is_kt_enabled:
+                        # Use optimizer.zero_grad() with set_to_none=False to keep KT LoRA grad views alive.
+                        self.optimizer.zero_grad(set_to_none=False)
+                    else:
+                        model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
@@ -3238,9 +3314,15 @@ class Trainer:
             save_fsdp_model(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **get_fsdp_ckpt_kwargs()
             )
-            save_fsdp_optimizer(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
-            )
+            # When KT is enabled, KT LoRA params are not managed by FSDP, so we can't use
+            # save_fsdp_optimizer (it fails to map KT LoRA params). Use regular torch.save instead.
+            if self.is_kt_enabled:
+                if self.args.should_save:
+                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            else:
+                save_fsdp_optimizer(
+                    self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
+                )
         elif self.args.should_save:
             # deepspeed.save_checkpoint above saves model/optim/sched
             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
@@ -3642,7 +3724,7 @@ class Trainer:
                     # In distributed training however, we load directly on each GPU and risk the GPU OOM as it's more
                     # likely to get OOM on CPU (since we load num_gpu times the optimizer state
                     map_location = self.args.device if self.args.world_size > 1 else "cpu"
-                    if self.is_fsdp_enabled:
+                    if self.is_fsdp_enabled and not self.is_kt_enabled:
                         load_fsdp_optimizer(
                             self.accelerator.state.fsdp_plugin,
                             self.accelerator,
@@ -3843,6 +3925,10 @@ class Trainer:
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+
+        if self.is_kt_enabled and save_kt_moe_to_adapter is not None and self.args.should_save:
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            save_kt_moe_to_adapter(kt_model, output_dir)
 
     # ---- Logging & Metrics ----
 
