@@ -4600,7 +4600,12 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # In this case we need to move everything back
         if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
+            from .integrations.kt import is_kt_expert_loading_enabled
+            _kt_skip_zeros = is_kt_expert_loading_enabled()
+            _kt_expert_re = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)") if _kt_skip_zeros else None
             for key, param in self.named_parameters():
+                if _kt_expert_re is not None and _kt_expert_re.search(key):
+                    continue
                 value = torch.zeros_like(param, device="cpu")
                 _load_parameter_into_model(self, key, value)
             for key, buffer in self.named_buffers():
