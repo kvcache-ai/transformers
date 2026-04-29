@@ -74,7 +74,7 @@ deps = {
     "tiktoken": "tiktoken",
     "timm": "timm>=1.0.23",
     "tokenizers": "tokenizers>=0.22.0,<=0.23.0",
-    "torch": "torch>=2.10,<2.12",
+    "torch": "torch==2.9.1",
     "torchaudio": "torchaudio",
     "torchvision": "torchvision",
     "pyctcdecode": "pyctcdecode>=0.4.0",
