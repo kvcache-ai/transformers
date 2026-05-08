@@ -1418,7 +1418,7 @@ class TrainingArguments:
         metadata={
             "help": (
                 "Enable KTransformers and pass a KT config dict or path to a json config file. "
-                "KTransformers accelerates MoE models using CPU AMX instructions."
+                "KTransformers enables MoE expert offload through kt-kernel."
             )
         },
     )
@@ -1698,7 +1698,7 @@ class TrainingArguments:
         if kt_config_dict is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
             if not is_accelerate_available():
                 raise ValueError(
-                    f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'`."
+                    f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`."
                 )
             from .integrations.kt import HfTrainerKTConfig
 
@@ -1838,7 +1838,7 @@ class TrainingArguments:
             if not is_accelerate_available():
                 raise ImportError(
                     f"Using the `Trainer` with `PyTorch` requires `accelerate>={ACCELERATE_MIN_VERSION}`: "
-                    f"Please run `pip install transformers[torch]` or `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'`"
+                    f"Please run `pip install transformers[torch]` or `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`"
                 )
         # Build kwargs for PartialState; actual init happens below
         accelerator_state_kwargs: dict[str, Any] = {"enabled": True, "use_configured_state": False}

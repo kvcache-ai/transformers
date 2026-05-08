@@ -33,24 +33,6 @@ ops = {
 }
 
 
-PACKAGE_VERSION_ALIASES = {
-    "accelerate": ("accelerate", "accelerate-kt"),
-}
-
-
-def _resolve_distribution_version(pkg: str) -> tuple[str, str]:
-    candidates = PACKAGE_VERSION_ALIASES.get(pkg, (pkg,))
-    for candidate in candidates:
-        try:
-            return candidate, importlib.metadata.version(candidate)
-        except importlib.metadata.PackageNotFoundError:
-            continue
-    looked_up = ", ".join(candidates)
-    raise importlib.metadata.PackageNotFoundError(
-        f"Tried metadata lookup for: {looked_up}"
-    )
-
-
 def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
     if got_ver is None or want_ver is None:
         raise ValueError(
@@ -116,16 +98,16 @@ def require_version(requirement: str, hint: str | None = None) -> None:
 
     # check if any version is installed
     try:
-        resolved_pkg, got_ver = _resolve_distribution_version(pkg)
-    except importlib.metadata.PackageNotFoundError as exc:
+        got_ver = importlib.metadata.version(pkg)
+    except importlib.metadata.PackageNotFoundError:
         raise importlib.metadata.PackageNotFoundError(
-            f"The '{requirement}' distribution was not found and is required by this application. {hint} ({exc})"
+            f"The '{requirement}' distribution was not found and is required by this application. {hint}"
         )
 
     # check that the right version is installed if version number or a range was provided
     if want_ver is not None:
         for op, want_ver in wanted.items():
-            _compare_versions(op, got_ver, want_ver, requirement, resolved_pkg, hint)
+            _compare_versions(op, got_ver, want_ver, requirement, pkg, hint)
 
 
 def require_version_core(requirement):

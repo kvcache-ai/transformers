@@ -741,7 +741,7 @@ class Trainer:
             min_accelerate_version = "1.12.0"
             if not is_accelerate_available(min_accelerate_version):
                 raise ImportError(
-                    f"ParallelismConfig requires accelerate>={min_accelerate_version}). Please upgrade accelerate-kt to use this feature."
+                    f"ParallelismConfig requires accelerate>={min_accelerate_version}). Please upgrade accelerate to use this feature."
                 )
             args["parallelism_config"] = self.args.parallelism_config
 
