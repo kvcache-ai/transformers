@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import json
 import math
 import os
@@ -726,6 +727,12 @@ class TrainingArguments:
           > If using ZeRO initialization, instantiate your model *after* initializing
           `TrainingArguments`, otherwise ZeRO won't be applied.
 
+        > KTransformers
+
+        kt_config (`str` or `dict`, *optional*):
+            Enable KTransformers integration. Value is either a path to a KTransformers JSON config file or a loaded
+            config as a dictionary.
+
         > Debugging & Profiling (Experimental)
 
         debug (`str` or list of [`~debug_utils.DebugOption`], *optional*, defaults to `""`):
@@ -1417,7 +1424,7 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": (
-                "Enable KTransformers and pass a KT config dict or path to a json config file. "
+                "Enable KTransformers and pass a KTransformers config dict or path to a JSON config file. "
                 "KTransformers enables MoE expert offload through kt-kernel."
             )
         },
@@ -1681,24 +1688,29 @@ class TrainingArguments:
         kt_config_dict = None
         if self.kt_config is not None:
             if isinstance(self.kt_config, str):
-                import json
-
-                with open(self.kt_config, "r") as f:
+                with open(self.kt_config, "r", encoding="utf-8") as f:
                     kt_config_dict = json.load(f)
             else:
-                kt_config_dict = self.kt_config
+                kt_config_dict = copy.deepcopy(self.kt_config)
 
         if kt_config_dict is None and is_accelerate_available() and self.accelerator_config is not None:
-            kt_config_dict = getattr(self.accelerator_config, "kt_config", None)
+            accelerator_kt_config = getattr(self.accelerator_config, "kt_config", None)
+            if accelerator_kt_config is not None:
+                kt_config_dict = copy.deepcopy(accelerator_kt_config)
 
-        if isinstance(kt_config_dict, dict):
-            kt_config_dict.setdefault("enabled", True)
-            kt_config_dict.setdefault("kt_skip_expert_loading", True)
+        use_kt_env = strtobool(os.environ.get("ACCELERATE_USE_KT", "false"))
+        if kt_config_dict is not None or use_kt_env:
+            if kt_config_dict is None:
+                kt_config_dict = {}
 
-        if kt_config_dict is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
+            if isinstance(kt_config_dict, dict):
+                kt_config_dict.setdefault("enabled", True)
+                kt_config_dict.setdefault("kt_skip_expert_loading", True)
+
             if not is_accelerate_available():
                 raise ValueError(
-                    f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`."
+                    "Using `kt_config` requires Accelerate to be installed: "
+                    f"`pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`."
                 )
             from .integrations.kt import HfTrainerKTConfig
 

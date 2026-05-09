@@ -210,7 +210,7 @@ if is_sagemaker_mp_enabled():
 if is_peft_available():
     from peft import PeftModel
 
-_accelerate_supports_kt_config = False
+_accelerate_supports_ktransformers_plugin = False
 
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches
@@ -234,10 +234,10 @@ if is_accelerate_available():
     try:
         from accelerate.utils import KTransformersPlugin
 
-        _accelerate_supports_kt_config = "kt_config" in inspect.signature(Accelerator).parameters
+        _accelerate_supports_ktransformers_plugin = "ktransformers_plugin" in inspect.signature(Accelerator).parameters
     except ImportError:
         KTransformersPlugin = None
-        _accelerate_supports_kt_config = False
+        _accelerate_supports_ktransformers_plugin = False
 
     try:
         from kt_kernel.sft import (
@@ -248,7 +248,13 @@ if is_accelerate_available():
             update_kt_lora_pointers,
         )
     except ImportError:
-        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = update_kt_lora_pointers = None
+        (
+            get_kt_lora_params,
+            kt_adapt_peft_lora,
+            load_kt_moe_from_adapter,
+            save_kt_moe_to_adapter,
+            update_kt_lora_pointers,
+        ) = (None, None, None, None, None)
 
 
 if TYPE_CHECKING:
@@ -766,22 +772,23 @@ class Trainer:
             )
             args["dynamo_plugin"] = dynamo_plugin
 
-        # KT plugin: forward kt_config from AcceleratorConfig to Accelerator
-        kt_config_dict = self.args.accelerator_config.kt_config if hasattr(self.args.accelerator_config, "kt_config") else None
+        # Forward kt_config from AcceleratorConfig to Accelerator.
+        kt_config_dict = getattr(self.args.accelerator_config, "kt_config", None)
         if kt_config_dict is not None:
-            if not _accelerate_supports_kt_config:
+            if not _accelerate_supports_ktransformers_plugin:
                 raise ImportError(
-                    "The installed `accelerate` version does not support `kt_config`. "
+                    "The installed `accelerate` version does not support `ktransformers_plugin`. "
                     "Please upgrade `accelerate` or remove `kt_config` from `accelerator_config`."
                 )
             if KTransformersPlugin is None:
                 raise ImportError(
-                    "KTransformersPlugin could not be imported from `accelerate`. Please upgrade to a version that includes it."
+                    "KTransformersPlugin could not be imported from `accelerate`. "
+                    "Please upgrade to a version that includes it."
                 )
             if isinstance(kt_config_dict, dict):
-                args["kt_config"] = KTransformersPlugin(**kt_config_dict)
+                args["ktransformers_plugin"] = KTransformersPlugin(**kt_config_dict)
             elif isinstance(kt_config_dict, KTransformersPlugin):
-                args["kt_config"] = kt_config_dict
+                args["ktransformers_plugin"] = kt_config_dict
             else:
                 raise TypeError("`kt_config` must be a dict or KTransformersPlugin instance.")
 
@@ -858,7 +865,10 @@ class Trainer:
         # deepspeed and accelerate flags covering both trainer args and accelerate launcher
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
-        self.is_kt_enabled = _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
+        self.is_kt_enabled = (
+            _accelerate_supports_ktransformers_plugin
+            and getattr(self.accelerator.state, "ktransformers_plugin", None) is not None
+        )
 
         # post accelerator creation setup
         if self.is_fsdp_enabled:
@@ -1538,7 +1548,7 @@ class Trainer:
         self._globalstep_last_logged = self.state.global_step
 
         if self.is_kt_enabled:
-            # Keep KT LoRA grad views alive (avoid set_to_none=True clearing them).
+            # Keep KTransformers LoRA grad views alive by avoiding set_to_none=True.
             self.optimizer.zero_grad(set_to_none=False)
         else:
             model.zero_grad()
@@ -1678,9 +1688,8 @@ class Trainer:
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             train_dataloader = self.accelerator.deepspeed_ulysses_dl_adapter(train_dataloader, model)
 
-        # KT LoRA adaptation: MUST happen AFTER all prepare() calls.
-        # FSDP2's prepare does model.to(meta) + load_state_dict(assign=True) which
-        # creates new param objects and destroys any .grad views set earlier.
+        # KTransformers LoRA adaptation must happen after all prepare() calls. FSDP2 prepare replaces parameter
+        # objects, which invalidates any .grad views set earlier.
         kt_model = None
         if self.is_kt_enabled:
             kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
@@ -1688,8 +1697,8 @@ class Trainer:
         if kt_model is not None and kt_adapt_peft_lora is not None:
             kt_adapt_peft_lora(kt_model)
 
-            # Inject fused expert LoRA params into existing optimizer's last param group
-            # (cannot use add_param_group — lr_scheduler is already created with fixed group count)
+            # Inject fused expert LoRA params into the existing optimizer's last param group. We cannot use
+            # add_param_group here because the lr_scheduler is already created with a fixed group count.
             if self.optimizer is not None and get_kt_lora_params is not None:
                 kt_lora_params = get_kt_lora_params(kt_model)
                 if kt_lora_params:
@@ -1697,7 +1706,7 @@ class Trainer:
                     new_params = [p for p in kt_lora_params if id(p) not in existing_ids]
                     if new_params:
                         self.optimizer.param_groups[-1]["params"].extend(new_params)
-                        logger.info(f"Injected {len(new_params)} fused expert LoRA params into optimizer")
+                        logger.info(f"Injected {len(new_params)} fused expert LoRA params into optimizer.")
 
         # load checkpoint
         if resume_from_checkpoint is not None:
@@ -1842,7 +1851,7 @@ class Trainer:
                             self.lr_scheduler.step()
 
                     if self.is_kt_enabled:
-                        # Use optimizer.zero_grad() with set_to_none=False to keep KT LoRA grad views alive.
+                        # Use optimizer.zero_grad() with set_to_none=False to keep KTransformers LoRA grad views alive.
                         self.optimizer.zero_grad(set_to_none=False)
                     else:
                         model.zero_grad()
@@ -3314,8 +3323,8 @@ class Trainer:
             save_fsdp_model(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **get_fsdp_ckpt_kwargs()
             )
-            # When KT is enabled, KT LoRA params are not managed by FSDP, so we can't use
-            # save_fsdp_optimizer (it fails to map KT LoRA params). Use regular torch.save instead.
+            # When KTransformers is enabled, KTransformers LoRA params are not managed by FSDP, so use regular
+            # torch.save instead of save_fsdp_optimizer.
             if self.is_kt_enabled:
                 if self.args.should_save:
                     torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))

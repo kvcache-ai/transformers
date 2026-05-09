@@ -1,4 +1,4 @@
-# Copyright 2025 the HuggingFace Inc. team.
+# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,16 +13,19 @@
 # limitations under the License.
 
 import os
+import re
 import weakref
-from typing import Any, Optional
+from typing import Any
 
 
-_kt_config_weak_ref: Optional[weakref.ReferenceType] = None
+_ENV_TRUE_VALUES = {"1", "true", "yes"}
+_KT_EXPERT_KEY_PATTERN = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)")
+_kt_config_weak_ref: weakref.ReferenceType | None = None
 
 
 class HfTrainerKTConfig:
     """
-    Lightweight KT config wrapper (similar in spirit to `HfTrainerDeepSpeedConfig`).
+    Lightweight KTransformers config wrapper (similar in spirit to `HfTrainerDeepSpeedConfig`).
 
     A weakref of this object is stored in the module globals so model-loading code (e.g. `from_pretrained`) can
     decide whether to skip loading MoE expert weights before a `Trainer`/`Accelerator` exists.
@@ -48,10 +51,11 @@ class HfTrainerKTConfig:
         "kt_lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
         "kt_model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
         "kt_skip_expert_loading": ("ACCELERATE_KT_SKIP_EXPERT_LOADING", bool),
+        "kt_share_backward_bb": ("ACCELERATE_KT_SHARE_BACKWARD_BB", bool),
     }
 
     def __init__(self, kt_config_dict: Any | None):
-        # Keep a reference to the original config so later mutations (e.g. filling defaults) are reflected here.
+        # Keep a reference to the processed config so later updates are reflected here.
         self._kt_config = kt_config_dict if kt_config_dict is not None else {}
 
         # Fill missing config values from ACCELERATE_KT_* env vars.
@@ -67,7 +71,7 @@ class HfTrainerKTConfig:
                 if env_val is None or env_val == "":
                     continue
                 if typ is bool:
-                    self._kt_config[key] = env_val.lower() in ("1", "true", "yes")
+                    self._kt_config[key] = env_val.lower() in _ENV_TRUE_VALUES
                 elif typ is int:
                     self._kt_config[key] = int(env_val)
                 elif typ is float:
@@ -99,7 +103,10 @@ class HfTrainerKTConfig:
     def trainer_config_process(self, args):
         """Adjust kt_config with TrainingArguments values, similar to DeepSpeed's trainer_config_process."""
         if getattr(args, "gradient_checkpointing", False):
-            self._kt_config.setdefault("kt_share_cache_pool", True)
+            if isinstance(self._kt_config, dict):
+                self._kt_config.setdefault("kt_share_cache_pool", True)
+            elif getattr(self._kt_config, "kt_share_cache_pool", None) is None:
+                self._kt_config.kt_share_cache_pool = True
 
     @property
     def enabled(self) -> bool:
@@ -108,17 +115,17 @@ class HfTrainerKTConfig:
         return True if enabled is None else bool(enabled)
 
     @property
-    def kt_weight_path(self) -> Optional[str]:
+    def kt_weight_path(self) -> str | None:
         return self._get("kt_weight_path", None)
 
     @property
-    def kt_skip_expert_loading(self) -> Optional[bool]:
+    def kt_skip_expert_loading(self) -> bool | None:
         # If the user explicitly configured it, respect it.
         explicit = self._get("kt_skip_expert_loading", None)
         if explicit is not None:
             return bool(explicit)
-        # Default: when KT is enabled, we skip expert loading and expect a later KT wrapper to load experts
-        # from `kt_weight_path` or via on-the-fly conversion from checkpoint shards.
+        # Default: when KTransformers is enabled, skip expert loading and expect a later KTransformers wrapper to load
+        # experts from `kt_weight_path` or via on-the-fly conversion from checkpoint shards.
         return True if self.enabled else False
 
 
@@ -132,13 +139,13 @@ def unset_kt_config() -> None:
     _kt_config_weak_ref = None
 
 
-def _get_kt_config() -> Optional[Any]:
+def _get_kt_config() -> Any | None:
     if _kt_config_weak_ref is None:
         return None
     return _kt_config_weak_ref()
 
 
-def is_kt_expert_loading_enabled() -> bool:
+def should_skip_kt_expert_loading() -> bool:
     kt_config: Any | None = _get_kt_config()
     if kt_config is not None:
         enabled = getattr(kt_config, "enabled", None)
@@ -147,14 +154,79 @@ def is_kt_expert_loading_enabled() -> bool:
         skip_loading = getattr(kt_config, "kt_skip_expert_loading", None)
         if skip_loading is not None:
             return bool(skip_loading)
-        # Default: if KT is enabled, skip loading expert weights (they will be supplied by KT later).
+        # Default: if KTransformers is enabled, skip loading expert weights.
         return True
 
-    env_enabled = os.environ.get("ACCELERATE_USE_KT", "").lower() in ("1", "true", "yes")
+    env_enabled = os.environ.get("ACCELERATE_USE_KT", "").lower() in _ENV_TRUE_VALUES
     if not env_enabled:
         return False
     env_skip = os.environ.get("ACCELERATE_KT_SKIP_EXPERT_LOADING", None)
     if env_skip is not None:
-        return env_skip.lower() in ("1", "true", "yes")
-    # Default: if KT is enabled, skip expert loading.
+        return env_skip.lower() in _ENV_TRUE_VALUES
+    # Default: if KTransformers is enabled, skip expert loading.
     return True
+
+
+def is_kt_expert_key(key: str) -> bool:
+    return _KT_EXPERT_KEY_PATTERN.search(key) is not None
+
+
+def set_kt_checkpoint_metadata(checkpoint_files=None, sharded_metadata=None) -> Any | None:
+    kt_config = _get_kt_config()
+    if kt_config is None:
+        return None
+
+    kt_config_dict = getattr(kt_config, "_kt_config", None)
+    if isinstance(kt_config_dict, dict):
+        if checkpoint_files is not None:
+            kt_config_dict.setdefault("kt_checkpoint_files", checkpoint_files)
+        if sharded_metadata is not None:
+            kt_config_dict.setdefault("kt_sharded_metadata", sharded_metadata)
+
+    return kt_config
+
+
+def filter_kt_expert_state_dict(state_dict: dict) -> dict:
+    return {key: value for key, value in state_dict.items() if not is_kt_expert_key(key)}
+
+
+def move_kt_missing_keys_to_cpu(model, missing_keys: set[str]) -> None:
+    import torch
+    from torch import nn
+
+    expert_missing = {key for key in missing_keys if is_kt_expert_key(key)}
+    if not expert_missing:
+        return
+
+    missing_keys -= expert_missing
+    for key in expert_missing:
+        splits = key.rsplit(".", 1)
+        if len(splits) != 2:
+            continue
+        module_path, param_name = splits
+        try:
+            module = model.get_submodule(module_path)
+        except AttributeError:
+            continue
+        param = getattr(module, param_name, None)
+        if param is not None and param.device == torch.device("meta"):
+            tiny_storage = torch.UntypedStorage(1, device="cpu")
+            fake_tensor = torch.tensor([], dtype=param.dtype, device="cpu").set_(
+                tiny_storage,
+                storage_offset=0,
+                size=param.shape,
+                stride=[0] * len(param.shape),
+            )
+            setattr(module, param_name, nn.Parameter(fake_tensor, requires_grad=False))
+        module._is_hf_initialized = True
+
+
+def wrap_model_with_kt_kernel(model, kt_config):
+    try:
+        from kt_kernel.sft import wrap_moe_layers_with_kt_wrapper
+    except ImportError as error:
+        raise ImportError("Using KTransformers requires `kt-kernel` to be installed.") from error
+
+    wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_config)
+    model._kt_wrappers = wrappers
+    return wrappers

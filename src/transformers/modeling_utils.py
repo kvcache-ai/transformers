@@ -4157,23 +4157,21 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         loading_info, disk_offload_index = cls._load_pretrained_model(model, state_dict, checkpoint_files, load_config)
         loading_info = cls._finalize_model_loading(model, load_config, loading_info)
 
-        # KT wrapping: if KT expert loading is enabled, wrap MoE layers with KT kernel
-        # before eval() so the model is returned in KT-wrapped state.
-        from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
-        if is_kt_expert_loading_enabled():
-            kt_config = _get_kt_config()
+        # If KTransformers skips expert weight loading, wrap MoE layers before eval() so the returned model is already
+        # KTransformers-wrapped.
+        from .integrations.kt import (
+            set_kt_checkpoint_metadata,
+            should_skip_kt_expert_loading,
+            wrap_model_with_kt_kernel,
+        )
+
+        if should_skip_kt_expert_loading():
+            kt_config = set_kt_checkpoint_metadata(
+                checkpoint_files=checkpoint_files, sharded_metadata=sharded_metadata
+            )
             if kt_config is not None:
-                if hasattr(kt_config, "_kt_config") and isinstance(kt_config._kt_config, dict):
-                    if checkpoint_files is not None:
-                        kt_config._kt_config.setdefault("kt_checkpoint_files", checkpoint_files)
-                    if sharded_metadata is not None:
-                        kt_config._kt_config.setdefault("kt_sharded_metadata", sharded_metadata)
-
-                from kt_kernel.sft import wrap_moe_layers_with_kt_wrapper
-
-                wrappers = wrap_moe_layers_with_kt_wrapper(model, kt_config)
-                model._kt_wrappers = wrappers
-                logger.info(f"[KT] Wrapped {len(wrappers)} MoE layers in from_pretrained")
+                wrappers = wrap_model_with_kt_kernel(model, kt_config)
+                logger.info(f"Wrapped {len(wrappers)} MoE layers with KTransformers in from_pretrained.")
 
         model.eval()  # Set model in evaluation mode to deactivate Dropout modules by default
         model.set_use_kernels(use_kernels, kernel_config)
@@ -4293,19 +4291,17 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             else:
                 raise ValueError("Neither a state dict nor checkpoint files were found.")
 
-            # KT: stash checkpoint_files on kt_config so from_pretrained's KT wrapper can access them,
-            # and filter expert keys from the state dict — KT kernel loads them directly.
-            from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
-            if is_kt_expert_loading_enabled():
-                kt_config = _get_kt_config()
-                if kt_config is not None:
-                    try:
-                        if hasattr(kt_config, "_kt_config") and isinstance(kt_config._kt_config, dict):
-                            kt_config._kt_config.setdefault("kt_checkpoint_files", checkpoint_files)
-                    except Exception:
-                        pass
-                _kt_re = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)")
-                merged_state_dict = {k: v for k, v in merged_state_dict.items() if not _kt_re.search(k)}
+            # Stash checkpoint_files on kt_config so the KTransformers wrapper can access them, and filter expert
+            # keys from the state dict because the KTransformers kernel loads them directly.
+            from .integrations.kt import (
+                filter_kt_expert_state_dict,
+                set_kt_checkpoint_metadata,
+                should_skip_kt_expert_loading,
+            )
+
+            if should_skip_kt_expert_loading():
+                set_kt_checkpoint_metadata(checkpoint_files=checkpoint_files)
+                merged_state_dict = filter_kt_expert_state_dict(merged_state_dict)
 
             loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
                 model=model,
@@ -4328,35 +4324,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         """Perform all post processing operations after having loaded some checkpoints into a model, such as moving
         missing keys from meta device to their expected device, reinitializing missing weights according to proper
         distributions, tying the weights and logging the loading report."""
-        # KT: filter expert keys from missing_keys and replace meta params with CPU placeholders.
-        from .integrations.kt import is_kt_expert_loading_enabled
-        if is_kt_expert_loading_enabled():
-            _kt_re_legacy = re.compile(r"\.experts\.\d+\.")
-            _kt_re_fused = re.compile(r"\.experts\.(gate_up_proj|down_proj|gate_proj|up_proj)$")
-            expert_missing = {
-                k for k in loading_info.missing_keys
-                if _kt_re_legacy.search(k) or _kt_re_fused.search(k)
-            }
-            if expert_missing:
-                loading_info.missing_keys -= expert_missing
-                for key in expert_missing:
-                    splits = key.rsplit(".", 1)
-                    if len(splits) != 2:
-                        continue
-                    module_path, param_name = splits
-                    try:
-                        module = model.get_submodule(module_path)
-                    except AttributeError:
-                        continue
-                    param = getattr(module, param_name, None)
-                    if param is not None and param.device == torch.device("meta"):
-                        tiny_storage = torch.UntypedStorage(1, device="cpu")
-                        fake_tensor = torch.tensor([], dtype=param.dtype, device="cpu").set_(
-                            tiny_storage, storage_offset=0, size=param.shape,
-                            stride=[0] * len(param.shape),
-                        )
-                        setattr(module, param_name, nn.Parameter(fake_tensor, requires_grad=False))
-                    module._is_hf_initialized = True
+        # Filter KTransformers expert keys from missing_keys and replace meta params with CPU placeholders.
+        from .integrations.kt import move_kt_missing_keys_to_cpu, should_skip_kt_expert_loading
+
+        if should_skip_kt_expert_loading():
+            move_kt_missing_keys_to_cpu(model, loading_info.missing_keys)
 
         try:
             # Marks tied weights as `_is_hf_initialized` to avoid initializing them (it's very important for efficiency)
@@ -4600,11 +4572,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # In this case we need to move everything back
         if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
-            from .integrations.kt import is_kt_expert_loading_enabled
-            _kt_skip_zeros = is_kt_expert_loading_enabled()
-            _kt_expert_re = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)") if _kt_skip_zeros else None
+            from .integrations.kt import is_kt_expert_key, should_skip_kt_expert_loading
+
+            skip_kt_experts = should_skip_kt_expert_loading()
             for key, param in self.named_parameters():
-                if _kt_expert_re is not None and _kt_expert_re.search(key):
+                if skip_kt_experts and is_kt_expert_key(key):
                     continue
                 value = torch.zeros_like(param, device="cpu")
                 _load_parameter_into_model(self, key, value)
