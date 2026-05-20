@@ -48,6 +48,8 @@ class HfTrainerKTConfig:
         "kt_lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
         "kt_model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
         "kt_skip_expert_loading": ("ACCELERATE_KT_SKIP_EXPERT_LOADING", bool),
+        "kt_train_mode": ("ACCELERATE_KT_TRAIN_MODE", str),
+        "kt_full_weight_grad": ("ACCELERATE_KT_FULL_WEIGHT_GRAD", bool),
     }
 
     def __init__(self, kt_config_dict: Any | None):
