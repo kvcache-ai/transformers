@@ -16,10 +16,12 @@ import json
 import os
 import tempfile
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
 
 from transformers.testing_utils import require_accelerate, require_torch
 from transformers.trainer import (
@@ -27,6 +29,7 @@ from transformers.trainer import (
     OPTIMIZER_NAME,
     SCHEDULER_NAME,
     Trainer,
+    _atomic_path_save,
     _atomic_torch_save,
     _kt_optimizer_rank_files,
     _read_kt_optimizer_manifest,
@@ -72,9 +75,73 @@ def _disable_checkpoint_collectives(trainer: Trainer) -> None:
     trainer._kt_checkpoint_barrier = lambda: None
 
 
+def _distributed_tail_failure_worker(rank: int, init_file: str, checkpoint: str, operation: str) -> None:
+    import transformers.trainer as trainer_module
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=2)
+    trainer = _make_trainer(_make_adamw([1, 1], float(rank + 1)), rank=rank, world_size=2)
+    original_atomic_save = trainer_module._atomic_torch_save
+
+    def injected_atomic_save(state_dict, destination):
+        failing_rank = 0 if operation == "scheduler" else 1
+        if rank == failing_rank:
+            raise OSError(f"injected {operation} failure")
+        original_atomic_save(state_dict, destination)
+
+    try:
+        with (
+            patch("transformers.trainer._atomic_torch_save", side_effect=injected_atomic_save),
+            patch("transformers.trainer.torch.cuda.is_available", return_value=False),
+        ):
+            if operation == "scheduler":
+                trainer._save_kt_fsdp_scheduler(checkpoint)
+            else:
+                trainer._run_kt_checkpoint_io(
+                    "RNG state save",
+                    partial(trainer._save_rng_state, checkpoint),
+                )
+    except RuntimeError as error:
+        if (operation == "scheduler" and rank == 0) or (operation == "rng" and rank == 1):
+            assert "failed on this rank" in str(error)
+        else:
+            assert "failed on another rank" in str(error)
+    else:
+        raise AssertionError(f"injected {operation} checkpoint failure did not propagate")
+    finally:
+        dist.destroy_process_group()
+
+
 @require_torch
 @require_accelerate
 class TrainerKTOptimizerCheckpointTest(unittest.TestCase):
+    def run_distributed_tail_failure(self, operation: str):
+        with tempfile.TemporaryDirectory() as checkpoint:
+            init_file = os.path.join(checkpoint, "distributed_init")
+            context = torch.multiprocessing.get_context("spawn")
+            processes = [
+                context.Process(
+                    target=_distributed_tail_failure_worker,
+                    args=(rank, init_file, checkpoint, operation),
+                )
+                for rank in range(2)
+            ]
+            for process in processes:
+                process.start()
+            for process in processes:
+                process.join(timeout=20)
+            hanging_processes = [process for process in processes if process.is_alive()]
+            for process in hanging_processes:
+                process.terminate()
+                process.join()
+            self.assertEqual(hanging_processes, [], f"{operation} failure left a distributed rank hanging")
+            self.assertEqual([process.exitcode for process in processes], [0, 0])
+
+    def test_two_rank_scheduler_failure_propagates_without_hang(self):
+        self.run_distributed_tail_failure("scheduler")
+
+    def test_two_rank_rng_failure_propagates_without_hang(self):
+        self.run_distributed_tail_failure("rng")
+
     def test_two_rank_checkpoint_loads_each_ranks_parameter_layout(self):
         with tempfile.TemporaryDirectory() as checkpoint:
             source_rank_0 = _make_trainer(_make_adamw([1, 2], 1.0), rank=0, world_size=2)
@@ -86,6 +153,7 @@ class TrainerKTOptimizerCheckpointTest(unittest.TestCase):
             source_rank_1._save_kt_fsdp_optimizer(checkpoint)
             source_rank_0._save_kt_fsdp_optimizer(checkpoint)
             torch.save(source_rank_0.lr_scheduler.state_dict(), os.path.join(checkpoint, SCHEDULER_NAME))
+            source_rank_0._publish_kt_fsdp_optimizer_manifest(checkpoint)
 
             with open(os.path.join(checkpoint, KT_OPTIMIZER_INDEX_NAME), encoding="utf-8") as handle:
                 manifest = json.load(handle)
@@ -148,6 +216,21 @@ class TrainerKTOptimizerCheckpointTest(unittest.TestCase):
 
             self.assertFalse(os.path.exists(old_manifest))
             self.assertFalse(os.path.exists(os.path.join(checkpoint, _kt_optimizer_rank_files(2)[0])))
+            self.assertEqual([name for name in os.listdir(checkpoint) if name.endswith(".tmp")], [])
+
+    def test_trainer_state_failure_does_not_publish_partial_file(self):
+        with tempfile.TemporaryDirectory() as checkpoint:
+            trainer_state_path = os.path.join(checkpoint, "trainer_state.json")
+
+            def failing_writer(temporary_path):
+                with open(temporary_path, "w", encoding="utf-8") as handle:
+                    handle.write('{"partial":')
+                raise OSError("injected trainer state failure")
+
+            with self.assertRaisesRegex(OSError, "injected trainer state failure"):
+                _atomic_path_save(failing_writer, trainer_state_path)
+
+            self.assertFalse(os.path.exists(trainer_state_path))
             self.assertEqual([name for name in os.listdir(checkpoint) if name.endswith(".tmp")], [])
 
     def test_legacy_multi_rank_optimizer_file_fails_explicitly(self):

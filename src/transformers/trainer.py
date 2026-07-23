@@ -273,8 +273,8 @@ def _kt_optimizer_rank_files(world_size: int) -> list[str]:
     return [f"optimizer_rank_{rank:05d}.pt" for rank in range(world_size)]
 
 
-def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
-    """Write a torch state dict without ever publishing a partial destination file."""
+def _atomic_path_save(save_function: Callable[[str], None], destination: str) -> None:
+    """Run a path-based writer without ever publishing a partial destination file."""
     output_dir = os.path.dirname(destination)
     os.makedirs(output_dir, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(
@@ -284,12 +284,17 @@ def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
     )
     os.close(fd)
     try:
-        torch.save(state_dict, temporary_path)
+        save_function(temporary_path)
         os.replace(temporary_path, destination)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
             os.remove(temporary_path)
         raise
+
+
+def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
+    """Atomically save a torch state dict."""
+    _atomic_path_save(partial(torch.save, state_dict), destination)
 
 
 def _atomic_json_save(payload: dict[str, Any], destination: str) -> None:
@@ -3241,31 +3246,45 @@ class Trainer:
             if os.path.exists(best_checkpoint_dir):
                 self.state.best_model_checkpoint = best_checkpoint_dir
 
+        is_kt_fsdp_distributed = self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1
+
         if not self.args.save_only_model:
             # Save optimizer and scheduler
             self._save_optimizer_and_scheduler(output_dir)
-            self._save_scaler(output_dir)
-            # Save RNG state
-            self._save_rng_state(output_dir)
+            if is_kt_fsdp_distributed:
+                self._run_kt_checkpoint_io("scaler save", partial(self._save_scaler, output_dir))
+                self._run_kt_checkpoint_io("RNG state save", partial(self._save_rng_state, output_dir))
+            else:
+                self._save_scaler(output_dir)
+                # Save RNG state
+                self._save_rng_state(output_dir)
 
         # Save the Trainer state
-        if self.args.should_save:
-            # Update `ExportableState` callbacks and `TrainerControl` state to where we are currently
-            for cb in [
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
-            ]:
-                cb_name = cb.__class__.__name__
-                cb_state = cb.state()
-                if isinstance(self.state.stateful_callbacks[cb_name], list):
-                    self.state.stateful_callbacks[cb_name].append(cb_state)
+        def save_trainer_state():
+            if self.args.should_save:
+                # Update `ExportableState` callbacks and `TrainerControl` state to where we are currently
+                for cb in [
+                    cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+                ]:
+                    cb_name = cb.__class__.__name__
+                    cb_state = cb.state()
+                    if isinstance(self.state.stateful_callbacks[cb_name], list):
+                        self.state.stateful_callbacks[cb_name].append(cb_state)
+                    else:
+                        self.state.stateful_callbacks[cb_name] = cb_state
+                trainer_state_path = os.path.join(output_dir, TRAINER_STATE_NAME)
+                if is_kt_fsdp_distributed:
+                    _atomic_path_save(self.state.save_to_json, trainer_state_path)
                 else:
-                    self.state.stateful_callbacks[cb_name] = cb_state
-            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+                    self.state.save_to_json(trainer_state_path)
 
-        # Do not publish or rotate a multi-rank KT/FSDP checkpoint until every rank has finished writing its local
-        # optimizer and RNG state.
-        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
-            self._kt_checkpoint_barrier()
+        if is_kt_fsdp_distributed:
+            self._run_kt_checkpoint_io("trainer state save", save_trainer_state)
+            if not self.args.save_only_model:
+                # The manifest is the completion marker and must be published only after every checkpoint component.
+                self._publish_kt_fsdp_optimizer_manifest(output_dir)
+        else:
+            save_trainer_state()
 
         if self.args.push_to_hub:
             self._push_from_checkpoint(output_dir)
@@ -3365,9 +3384,14 @@ class Trainer:
         os.makedirs(output_dir, exist_ok=True)
 
         if self.args.world_size <= 1:
-            torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+            rng_state_path = os.path.join(output_dir, "rng_state.pth")
         else:
-            torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth"))
+            rng_state_path = os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth")
+
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            _atomic_torch_save(rng_states, rng_state_path)
+        else:
+            torch.save(rng_states, rng_state_path)
 
     def _kt_checkpoint_barrier(self) -> None:
         if self.args.world_size <= 1:
@@ -3396,6 +3420,15 @@ class Trainer:
                 raise RuntimeError(f"KT checkpoint {operation} failed on this rank: {local_error}") from local_error
             raise RuntimeError(f"KT checkpoint {operation} failed on another rank.")
 
+    def _run_kt_checkpoint_io(self, operation: str, save_function: Callable[[], None]) -> None:
+        local_error = None
+        try:
+            save_function()
+        except Exception as error:
+            local_error = error
+        self._raise_if_kt_checkpoint_failed(local_error, operation)
+        self._kt_checkpoint_barrier()
+
     def _save_kt_fsdp_optimizer(self, output_dir: str) -> None:
         world_size = self.args.world_size
         rank = self.args.process_index
@@ -3423,14 +3456,29 @@ class Trainer:
         self._raise_if_kt_checkpoint_failed(rank_save_error, f"optimizer save for rank {rank}")
         self._kt_checkpoint_barrier()
 
+    def _save_kt_fsdp_scheduler(self, output_dir: str) -> None:
+        def save_scheduler():
+            if self.args.process_index == 0:
+                _atomic_torch_save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
+        self._run_kt_checkpoint_io("scheduler save", save_scheduler)
+
+    def _publish_kt_fsdp_optimizer_manifest(self, output_dir: str) -> None:
+        world_size = self.args.world_size
+        rank_files = _kt_optimizer_rank_files(world_size)
         manifest_error = None
-        if rank == 0:
+        if self.args.process_index == 0:
             manifest = {
                 "version": KT_OPTIMIZER_INDEX_VERSION,
                 "world_size": world_size,
                 "rank_files": rank_files,
             }
             try:
+                missing_rank_files = [
+                    filename for filename in rank_files if not os.path.isfile(os.path.join(output_dir, filename))
+                ]
+                if missing_rank_files:
+                    raise RuntimeError(f"missing optimizer rank files: {missing_rank_files!r}")
                 _atomic_json_save(manifest, os.path.join(output_dir, KT_OPTIMIZER_INDEX_NAME))
             except Exception as error:
                 manifest_error = error
@@ -3533,7 +3581,9 @@ class Trainer:
         is_deepspeed_custom_scheduler = self.is_deepspeed_enabled and not isinstance(
             self.lr_scheduler, DeepSpeedSchedulerWrapper
         )
-        if (
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            self._save_kt_fsdp_scheduler(output_dir)
+        elif (
             self.args.should_save
             and (not self.is_deepspeed_enabled or is_deepspeed_custom_scheduler)
             and not is_torch_xla_available()
@@ -3560,7 +3610,12 @@ class Trainer:
         # Save SCALER
         if self.args.should_save and not is_torch_xla_available():
             with warnings.catch_warnings(record=True) as caught_warnings:
-                torch.save(self.accelerator.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+                scaler_state = self.accelerator.scaler.state_dict()
+                scaler_path = os.path.join(output_dir, SCALER_NAME)
+                if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+                    _atomic_torch_save(scaler_state, scaler_path)
+                else:
+                    torch.save(scaler_state, scaler_path)
             reissue_pt_warnings(caught_warnings)
 
     # ---- Checkpoint Resuming ----
