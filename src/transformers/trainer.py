@@ -261,10 +261,103 @@ logger = logging.get_logger(__name__)
 TRAINING_ARGS_NAME = "training_args.bin"
 TRAINER_STATE_NAME = "trainer_state.json"
 OPTIMIZER_NAME = "optimizer.pt"
+KT_OPTIMIZER_INDEX_NAME = "kt_optimizer.index.json"
+KT_OPTIMIZER_INDEX_VERSION = 1
 SCALER_NAME = "scaler.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 FSDP_MODEL_NAME = "pytorch_model_fsdp"
+
+
+def _kt_optimizer_rank_files(world_size: int) -> list[str]:
+    return [f"optimizer_rank_{rank:05d}.pt" for rank in range(world_size)]
+
+
+def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
+    """Write a torch state dict without ever publishing a partial destination file."""
+    output_dir = os.path.dirname(destination)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        dir=output_dir,
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    try:
+        torch.save(state_dict, temporary_path)
+        os.replace(temporary_path, destination)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temporary_path)
+        raise
+
+
+def _atomic_json_save(payload: dict[str, Any], destination: str) -> None:
+    """Atomically publish a small JSON manifest."""
+    output_dir = os.path.dirname(destination)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        dir=output_dir,
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temporary_path)
+        raise
+
+
+def _read_kt_optimizer_manifest(checkpoint: str, expected_world_size: int) -> list[str]:
+    manifest_path = os.path.join(checkpoint, KT_OPTIMIZER_INDEX_NAME)
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Could not read KT optimizer manifest {manifest_path}: {error}") from error
+
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"KT optimizer manifest {manifest_path} must contain a JSON object.")
+
+    version = manifest.get("version", KT_OPTIMIZER_INDEX_VERSION)
+    if version != KT_OPTIMIZER_INDEX_VERSION:
+        raise RuntimeError(
+            f"KT optimizer manifest {manifest_path} has unsupported version {version!r}; "
+            f"expected {KT_OPTIMIZER_INDEX_VERSION}."
+        )
+
+    world_size = manifest.get("world_size")
+    if not isinstance(world_size, int) or isinstance(world_size, bool):
+        raise RuntimeError(f"KT optimizer manifest {manifest_path} has a non-integer `world_size`.")
+    if world_size != expected_world_size:
+        raise RuntimeError(
+            f"KT optimizer checkpoint was saved with world_size={world_size}, but the current run uses "
+            f"world_size={expected_world_size}. Resume with the original world size."
+        )
+
+    rank_files = manifest.get("rank_files")
+    expected_rank_files = _kt_optimizer_rank_files(expected_world_size)
+    if rank_files != expected_rank_files:
+        raise RuntimeError(
+            f"KT optimizer manifest {manifest_path} must contain `rank_files` in global-rank order: "
+            f"{expected_rank_files!r}."
+        )
+
+    missing_rank_files = [
+        filename for filename in rank_files if not os.path.isfile(os.path.join(checkpoint, filename))
+    ]
+    if missing_rank_files:
+        raise RuntimeError(
+            f"KT optimizer checkpoint {checkpoint} is incomplete; missing rank files: {missing_rank_files!r}."
+        )
+    return rank_files
 
 
 @requires(
@@ -1196,18 +1289,21 @@ class Trainer:
         opt_model = self.model if model is None else model
 
         if self.optimizer is None:
-            decay_parameters = self.get_decay_parameter_names(opt_model)
+            decay_parameters = set(self.get_decay_parameter_names(opt_model))
+            trainable_named_parameters = [(n, p) for n, p in opt_model.named_parameters() if p.requires_grad]
+            if os.environ.get("USE_KT") == "1":
+                print(
+                    f"[kt_smoke] trainer.create_optimizer: decay_names={len(decay_parameters)} "
+                    f"trainable_named_parameters={len(trainable_named_parameters)}",
+                    flush=True,
+                )
             optimizer_grouped_parameters = [
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
-                    ],
+                    "params": [p for n, p in trainable_named_parameters if n in decay_parameters],
                     "weight_decay": self.args.weight_decay,
                 },
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
-                    ],
+                    "params": [p for n, p in trainable_named_parameters if n not in decay_parameters],
                     "weight_decay": 0.0,
                 },
             ]
@@ -3166,6 +3262,11 @@ class Trainer:
                     self.state.stateful_callbacks[cb_name] = cb_state
             self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
 
+        # Do not publish or rotate a multi-rank KT/FSDP checkpoint until every rank has finished writing its local
+        # optimizer and RNG state.
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            self._kt_checkpoint_barrier()
+
         if self.args.push_to_hub:
             self._push_from_checkpoint(output_dir)
 
@@ -3268,6 +3369,105 @@ class Trainer:
         else:
             torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth"))
 
+    def _kt_checkpoint_barrier(self) -> None:
+        if self.args.world_size <= 1:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("KT distributed checkpointing requires an initialized torch.distributed process group.")
+        dist.barrier()
+
+    def _raise_if_kt_checkpoint_failed(self, local_error: Exception | None, operation: str) -> None:
+        """Make every rank fail instead of leaving peers blocked at a checkpoint barrier."""
+        if self.args.world_size <= 1:
+            if local_error is not None:
+                raise RuntimeError(f"KT checkpoint {operation} failed: {local_error}") from local_error
+            return
+
+        if not dist.is_available() or not dist.is_initialized():
+            if local_error is not None:
+                raise RuntimeError(f"KT checkpoint {operation} failed: {local_error}") from local_error
+            raise RuntimeError("KT distributed checkpointing requires an initialized torch.distributed process group.")
+
+        collective_device = self.args.device if dist.get_backend() == dist.Backend.NCCL else torch.device("cpu")
+        failure = torch.tensor(int(local_error is not None), dtype=torch.int32, device=collective_device)
+        dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+        if failure.item():
+            if local_error is not None:
+                raise RuntimeError(f"KT checkpoint {operation} failed on this rank: {local_error}") from local_error
+            raise RuntimeError(f"KT checkpoint {operation} failed on another rank.")
+
+    def _save_kt_fsdp_optimizer(self, output_dir: str) -> None:
+        world_size = self.args.world_size
+        rank = self.args.process_index
+        rank_files = _kt_optimizer_rank_files(world_size)
+        rank_path = os.path.join(output_dir, rank_files[rank])
+
+        # Fixed per-rank filenames are overwritten on a retry. Remove the old publication marker first so an
+        # interrupted retry can never make a stale manifest advertise a mixture of old and new rank files.
+        manifest_invalidation_error = None
+        if rank == 0:
+            try:
+                os.remove(os.path.join(output_dir, KT_OPTIMIZER_INDEX_NAME))
+            except FileNotFoundError:
+                pass
+            except Exception as error:
+                manifest_invalidation_error = error
+        self._raise_if_kt_checkpoint_failed(manifest_invalidation_error, "old optimizer manifest invalidation")
+        self._kt_checkpoint_barrier()
+
+        rank_save_error = None
+        try:
+            _atomic_torch_save(self.optimizer.state_dict(), rank_path)
+        except Exception as error:
+            rank_save_error = error
+        self._raise_if_kt_checkpoint_failed(rank_save_error, f"optimizer save for rank {rank}")
+        self._kt_checkpoint_barrier()
+
+        manifest_error = None
+        if rank == 0:
+            manifest = {
+                "version": KT_OPTIMIZER_INDEX_VERSION,
+                "world_size": world_size,
+                "rank_files": rank_files,
+            }
+            try:
+                _atomic_json_save(manifest, os.path.join(output_dir, KT_OPTIMIZER_INDEX_NAME))
+            except Exception as error:
+                manifest_error = error
+        self._raise_if_kt_checkpoint_failed(manifest_error, "optimizer manifest publication")
+        self._kt_checkpoint_barrier()
+
+    def _resolve_kt_fsdp_optimizer(self, checkpoint: str) -> str | None:
+        manifest_path = os.path.join(checkpoint, KT_OPTIMIZER_INDEX_NAME)
+        rank_files_on_disk = glob.glob(os.path.join(checkpoint, "optimizer_rank_*.pt"))
+
+        if os.path.isfile(manifest_path):
+            rank_files = _read_kt_optimizer_manifest(checkpoint, self.args.world_size)
+            rank = self.args.process_index
+            if rank < 0 or rank >= len(rank_files):
+                raise RuntimeError(
+                    f"Current process index {rank} is outside the KT optimizer manifest's rank range "
+                    f"[0, {len(rank_files)})."
+                )
+            return os.path.join(checkpoint, rank_files[rank])
+
+        if rank_files_on_disk:
+            raise RuntimeError(
+                f"KT optimizer checkpoint {checkpoint} has per-rank optimizer files but no "
+                f"{KT_OPTIMIZER_INDEX_NAME}; the save did not complete and cannot be resumed safely."
+            )
+
+        legacy_optimizer_exists = os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME)) or os.path.isfile(
+            os.path.join(checkpoint, OPTIMIZER_NAME_BIN)
+        )
+        if legacy_optimizer_exists:
+            raise RuntimeError(
+                "This is a legacy multi-rank KT/FSDP checkpoint with one shared optimizer file. It cannot be resumed "
+                "safely because each rank has a different optimizer parameter layout. Resume from a checkpoint "
+                f"containing {KT_OPTIMIZER_INDEX_NAME}, or restart training from the saved model weights."
+            )
+        return None
+
     def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
         """Save optimizer and learning rate scheduler states to `output_dir`."""
         if is_torch_xla_available():
@@ -3314,11 +3514,13 @@ class Trainer:
             save_fsdp_model(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **get_fsdp_ckpt_kwargs()
             )
-            # When KT is enabled, KT LoRA params are not managed by FSDP, so we can't use
-            # save_fsdp_optimizer (it fails to map KT LoRA params). Use regular torch.save instead.
+            # KT params are not managed by FSDP, so save each rank's optimizer state separately. Optimizer parameter
+            # groups differ by rank, and a shared rank-0 state dict cannot be loaded safely on the other ranks.
             if self.is_kt_enabled:
-                if self.args.should_save:
-                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+                if self.args.world_size > 1:
+                    self._save_kt_fsdp_optimizer(output_dir)
+                elif self.args.should_save:
+                    _atomic_torch_save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
             else:
                 save_fsdp_optimizer(
                     self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
@@ -3659,27 +3861,38 @@ class Trainer:
                 reissue_pt_warnings(caught_warnings)
             return
 
-        checkpoint_file_exists = (
-            glob.glob(os.path.join(checkpoint, OPTIMIZER_NAME) + "_*")
-            if is_sagemaker_mp_enabled()
-            else (
-                os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME))
-                or os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME_BIN))
-                or (
-                    os.path.isdir(checkpoint)
-                    and any(
-                        OPTIMIZER_NAME_BIN.split(".")[0] in folder_name
-                        for folder_name in os.listdir(checkpoint)
-                        if os.path.isdir(os.path.join(checkpoint, folder_name))
+        kt_fsdp_optimizer_path = None
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            kt_fsdp_optimizer_path = self._resolve_kt_fsdp_optimizer(checkpoint)
+            checkpoint_file_exists = kt_fsdp_optimizer_path is not None
+        else:
+            checkpoint_file_exists = (
+                glob.glob(os.path.join(checkpoint, OPTIMIZER_NAME) + "_*")
+                if is_sagemaker_mp_enabled()
+                else (
+                    os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME))
+                    or os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME_BIN))
+                    or (
+                        os.path.isdir(checkpoint)
+                        and any(
+                            OPTIMIZER_NAME_BIN.split(".")[0] in folder_name
+                            for folder_name in os.listdir(checkpoint)
+                            if os.path.isdir(os.path.join(checkpoint, folder_name))
+                        )
                     )
                 )
             )
-        )
-        checkpoint_file_exists = (
-            glob.glob(os.path.join(checkpoint, f"rank*-of-{self.args.world_size}-{OPTIMIZER_NAME}"))
-            if self.is_fsdp_xla_v1_enabled
-            else checkpoint_file_exists
-        )
+            checkpoint_file_exists = (
+                glob.glob(os.path.join(checkpoint, f"rank*-of-{self.args.world_size}-{OPTIMIZER_NAME}"))
+                if self.is_fsdp_xla_v1_enabled
+                else checkpoint_file_exists
+            )
+
+        if kt_fsdp_optimizer_path is not None and not os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
+            raise RuntimeError(
+                f"KT optimizer checkpoint {checkpoint} is missing {SCHEDULER_NAME} and cannot be resumed safely."
+            )
+
         if checkpoint_file_exists and os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
             # Load in optimizer and scheduler states
             if is_torch_xla_available():
@@ -3732,6 +3945,11 @@ class Trainer:
                             self.model,
                             checkpoint,
                             **get_fsdp_ckpt_kwargs(),
+                        )
+                    elif kt_fsdp_optimizer_path is not None:
+                        check_torch_load_is_safe()
+                        self.optimizer.load_state_dict(
+                            torch.load(kt_fsdp_optimizer_path, map_location="cpu", weights_only=True)
                         )
                     else:
                         check_torch_load_is_safe()
