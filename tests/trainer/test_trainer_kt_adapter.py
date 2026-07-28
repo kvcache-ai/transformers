@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+import os
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from transformers.trainer import (
     Trainer,
@@ -26,7 +31,104 @@ from transformers.trainer import (
 )
 
 
+def _make_tiny_base_model():
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        tie_word_embeddings=False,
+    )
+    return LlamaForCausalLM(config)
+
+
+def _make_tiny_peft_model():
+    from peft import LoraConfig, get_peft_model
+
+    torch.manual_seed(123)
+    return get_peft_model(
+        _make_tiny_base_model(),
+        LoraConfig(r=2, lora_alpha=4, target_modules=["q_proj"], bias="none"),
+    )
+
+
+def _fsdp2_peft_save_worker(
+    rank: int,
+    init_file: str,
+    output_dir: str,
+) -> None:
+    from peft import PeftModel
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp import fully_shard
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        model = _make_tiny_peft_model()
+        fully_shard(
+            model,
+            mesh=DeviceMesh("cpu", [0, 1]),
+            reshard_after_forward=True,
+        )
+        assert isinstance(model, PeftModel)
+        state_dict = _get_kt_fsdp2_peft_state_dict(model)
+        if rank == 0:
+            assert set(state_dict) == {
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight",
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight",
+            }
+            assert all(tensor.device.type == "cpu" for tensor in state_dict.values())
+            model.save_pretrained(output_dir, state_dict=state_dict)
+        else:
+            assert state_dict == {}
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 class TrainerKTAdapterReloadTest(unittest.TestCase):
+    @unittest.skipUnless(
+        dist.is_available() and os.name != "nt" and importlib.util.find_spec("peft") is not None,
+        "requires distributed PyTorch and PEFT on a POSIX platform",
+    )
+    def test_fsdp2_adapter_state_is_lora_only_and_reloadable(self):
+        from peft import PeftModel
+        from safetensors.torch import load_file
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            output_dir = root / "adapter"
+            mp.spawn(
+                _fsdp2_peft_save_worker,
+                args=(str(root / "process-group"), str(output_dir)),
+                nprocs=2,
+                join=True,
+            )
+
+            saved = load_file(output_dir / "adapter_model.safetensors")
+            self.assertEqual(
+                set(saved),
+                {
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                },
+            )
+            fresh = PeftModel.from_pretrained(_make_tiny_base_model(), output_dir)
+            fresh_state = fresh.state_dict()
+            for key, value in saved.items():
+                runtime_key = key.replace(".lora_A.weight", ".lora_A.default.weight").replace(
+                    ".lora_B.weight", ".lora_B.default.weight"
+                )
+                torch.testing.assert_close(fresh_state[runtime_key], value)
+
     def test_kt_fsdp2_peft_save_avoids_accelerate_full_state_gather(self):
         trainer = object.__new__(Trainer)
         trainer.args = SimpleNamespace(
