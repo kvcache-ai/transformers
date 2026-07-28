@@ -4388,6 +4388,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 logger=logger,
             )
 
+        from .integrations.kt import _validate_kt_int8_loading_info
+
+        _validate_kt_int8_loading_info(loading_info, model)
         return loading_info
 
     def retrieve_modules_from_names(self, names, add_prefix=False, remove_prefix=False):

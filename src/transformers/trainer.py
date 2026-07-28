@@ -292,6 +292,28 @@ def _atomic_path_save(save_function: Callable[[str], None], destination: str) ->
         raise
 
 
+def _load_fresh_kt_adapter(model: nn.Module, resume_from_checkpoint: str | None) -> str | None:
+    """Restore KT-owned adapter tensors after the post-FSDP LoRA adaptation step."""
+    if (
+        resume_from_checkpoint is not None
+        or load_kt_moe_from_adapter is None
+        or getattr(model, "_kt_adapter_loaded", False)
+    ):
+        return None
+
+    adapter_path = getattr(model, "_kt_adapter_path", None)
+    if adapter_path is None:
+        return None
+    if not isinstance(adapter_path, (str, os.PathLike)):
+        raise TypeError(f"`_kt_adapter_path` must be a path, got {type(adapter_path).__name__}.")
+
+    adapter_path = os.fspath(adapter_path)
+    load_kt_moe_from_adapter(model, adapter_path)
+    model._kt_adapter_loaded = True
+    logger.info(f"Loaded KT-owned adapter tensors from {adapter_path}")
+    return adapter_path
+
+
 def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
     """Atomically save a torch state dict."""
     _atomic_path_save(partial(torch.save, state_dict), destination)
@@ -1788,6 +1810,7 @@ class Trainer:
 
         if kt_model is not None and kt_adapt_peft_lora is not None:
             kt_adapt_peft_lora(kt_model)
+            _load_fresh_kt_adapter(kt_model, resume_from_checkpoint)
 
             # Inject fused expert LoRA params into existing optimizer's last param group
             # (cannot use add_param_group — lr_scheduler is already created with fixed group count)

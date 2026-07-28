@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 import weakref
 from typing import Any, Optional
 
@@ -41,6 +42,7 @@ class HfTrainerKTConfig:
         "kt_threadpool_count": ("ACCELERATE_KT_THREADPOOL_COUNT", int),
         "kt_max_cache_depth": ("ACCELERATE_KT_MAX_CACHE_DEPTH", int),
         "kt_weight_path": ("ACCELERATE_KT_WEIGHT_PATH", str),
+        "kt_expert_weight_format": ("ACCELERATE_KT_EXPERT_WEIGHT_FORMAT", str),
         "kt_use_lora_experts": ("ACCELERATE_KT_USE_LORA_EXPERTS", bool),
         "kt_lora_expert_num": ("ACCELERATE_KT_LORA_EXPERT_NUM", int),
         "kt_lora_expert_intermediate_size": ("ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE", int),
@@ -158,3 +160,58 @@ def is_kt_expert_loading_enabled() -> bool:
         return env_skip.lower() in ("1", "true", "yes")
     # Default: if KT is enabled, skip expert loading.
     return True
+
+
+_KT_ROUTED_EXPERT_KEY = re.compile(r"\.experts\.(?:\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)")
+_DEEPSEEK_V3_MTP_KEY = re.compile(r"^model\.layers\.61\.")
+
+
+def is_kt_int8_expert_loading_enabled() -> bool:
+    """Whether checkpoint expert tensors are replaced by pre-quantized KT INT8 weights."""
+    if not is_kt_expert_loading_enabled():
+        return False
+
+    kt_config = _get_kt_config()
+    weight_format = getattr(kt_config, "kt_expert_weight_format", None) if kt_config is not None else None
+    if weight_format is None:
+        weight_format = os.environ.get("ACCELERATE_KT_EXPERT_WEIGHT_FORMAT")
+    return isinstance(weight_format, str) and weight_format.lower() == "int8"
+
+
+def _validate_kt_int8_loading_info(loading_info: Any, model: Any | None = None) -> None:
+    """Fail closed when a KT INT8 checkpoint did not fully populate the non-expert model."""
+    if not is_kt_int8_expert_loading_enabled():
+        return
+
+    config = getattr(model, "config", None)
+    allow_deepseek_mtp = (
+        getattr(config, "model_type", None) == "deepseek_v3" and getattr(config, "num_hidden_layers", None) == 61
+    )
+    missing_keys = sorted(key for key in loading_info.missing_keys if not _KT_ROUTED_EXPERT_KEY.search(key))
+    mismatched_keys = sorted(
+        mismatch for mismatch in loading_info.mismatched_keys if not _KT_ROUTED_EXPERT_KEY.search(mismatch[0])
+    )
+    conversion_errors = {
+        key: error for key, error in loading_info.conversion_errors.items() if not _KT_ROUTED_EXPERT_KEY.search(key)
+    }
+    unexpected_keys = sorted(
+        key for key in loading_info.unexpected_keys if not (allow_deepseek_mtp and _DEEPSEEK_V3_MTP_KEY.match(key))
+    )
+    error_msgs = list(loading_info.error_msgs)
+
+    failures = []
+    if missing_keys:
+        failures.append(f"missing_keys={missing_keys}")
+    if mismatched_keys:
+        failures.append(f"mismatched_keys={mismatched_keys}")
+    if conversion_errors:
+        failures.append(f"conversion_errors={conversion_errors}")
+    if unexpected_keys:
+        failures.append(f"unexpected_keys={unexpected_keys}")
+    if error_msgs:
+        failures.append(f"error_msgs={error_msgs}")
+
+    if failures:
+        raise RuntimeError(
+            "KT INT8 checkpoint loading requires an exact non-expert model match; " + "; ".join(failures)
+        )
