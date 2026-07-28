@@ -318,6 +318,20 @@ def _load_fresh_kt_adapter(model: nn.Module, resume_from_checkpoint: str | None)
     return adapter_path
 
 
+def _get_kt_fsdp2_peft_state_dict(model: nn.Module) -> dict[str, Any]:
+    """Gather only trainable PEFT state for a KT FSDP2 adapter save."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+    return get_model_state_dict(
+        model,
+        options=StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=True,
+            ignore_frozen_params=True,
+        ),
+    )
+
+
 def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
     """Atomically save a torch state dict."""
     _atomic_path_save(partial(torch.save, state_dict), destination)
@@ -4157,7 +4171,12 @@ class Trainer:
                 self._save(output_dir, state_dict=state_dict)
             Path(os.path.join(output_dir, "user_content.pt")).touch()
         elif self.is_fsdp_enabled:
-            if "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
+            is_fsdp2 = getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
+            if self.is_kt_enabled and is_fsdp2 and _is_peft_model(self.model):
+                state_dict = _get_kt_fsdp2_peft_state_dict(self.model)
+                if self.args.should_save:
+                    self._save(output_dir, state_dict=state_dict)
+            elif "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
                 state_dict = self.accelerator.get_state_dict(self.model)
                 if self.args.should_save:
                     self._save(output_dir, state_dict=state_dict)
