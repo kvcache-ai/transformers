@@ -248,7 +248,9 @@ if is_accelerate_available():
             update_kt_lora_pointers,
         )
     except ImportError:
-        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = update_kt_lora_pointers = None
+        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = (
+            update_kt_lora_pointers
+        ) = None
 
 
 if TYPE_CHECKING:
@@ -308,7 +310,9 @@ def _load_fresh_kt_adapter(model: nn.Module, resume_from_checkpoint: str | None)
         raise TypeError(f"`_kt_adapter_path` must be a path, got {type(adapter_path).__name__}.")
 
     adapter_path = os.fspath(adapter_path)
-    load_kt_moe_from_adapter(model, adapter_path)
+    from .integrations.kt_artifacts import load_kt_adapter_artifacts
+
+    load_kt_adapter_artifacts(model, adapter_path, load_kt_moe_from_adapter)
     model._kt_adapter_loaded = True
     logger.info(f"Loaded KT-owned adapter tensors from {adapter_path}")
     return adapter_path
@@ -887,7 +891,9 @@ class Trainer:
             args["dynamo_plugin"] = dynamo_plugin
 
         # KT plugin: forward kt_config from AcceleratorConfig to Accelerator
-        kt_config_dict = self.args.accelerator_config.kt_config if hasattr(self.args.accelerator_config, "kt_config") else None
+        kt_config_dict = (
+            self.args.accelerator_config.kt_config if hasattr(self.args.accelerator_config, "kt_config") else None
+        )
         if kt_config_dict is not None:
             if not _accelerate_supports_kt_config:
                 raise ImportError(
@@ -978,7 +984,9 @@ class Trainer:
         # deepspeed and accelerate flags covering both trainer args and accelerate launcher
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
-        self.is_kt_enabled = _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
+        self.is_kt_enabled = (
+            _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
+        )
 
         # post accelerator creation setup
         if self.is_fsdp_enabled:
@@ -1836,7 +1844,9 @@ class Trainer:
             self._load_scaler(resume_from_checkpoint)
 
             if kt_model is not None and load_kt_moe_from_adapter is not None:
-                load_kt_moe_from_adapter(kt_model, resume_from_checkpoint)
+                from .integrations.kt_artifacts import load_kt_adapter_artifacts
+
+                load_kt_adapter_artifacts(kt_model, resume_from_checkpoint, load_kt_moe_from_adapter)
 
         # Update the references for the callback_handler
         for attr in ("model", "optimizer", "lr_scheduler"):
@@ -4224,7 +4234,9 @@ class Trainer:
 
         if self.is_kt_enabled and save_kt_moe_to_adapter is not None and self.args.should_save:
             kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-            save_kt_moe_to_adapter(kt_model, output_dir)
+            from .integrations.kt_artifacts import save_kt_adapter_artifacts
+
+            save_kt_adapter_artifacts(kt_model, output_dir, save_kt_moe_to_adapter)
 
     # ---- Logging & Metrics ----
 

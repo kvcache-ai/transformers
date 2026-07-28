@@ -15,10 +15,10 @@
 import os
 import re
 import weakref
-from typing import Any, Optional
+from typing import Any
 
 
-_kt_config_weak_ref: Optional[weakref.ReferenceType] = None
+_kt_config_weak_ref: weakref.ReferenceType | None = None
 
 
 class HfTrainerKTConfig:
@@ -42,6 +42,7 @@ class HfTrainerKTConfig:
         "kt_threadpool_count": ("ACCELERATE_KT_THREADPOOL_COUNT", int),
         "kt_max_cache_depth": ("ACCELERATE_KT_MAX_CACHE_DEPTH", int),
         "kt_weight_path": ("ACCELERATE_KT_WEIGHT_PATH", str),
+        "kt_non_expert_weight_path": ("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH", str),
         "kt_expert_weight_format": ("ACCELERATE_KT_EXPERT_WEIGHT_FORMAT", str),
         "kt_use_lora_experts": ("ACCELERATE_KT_USE_LORA_EXPERTS", bool),
         "kt_lora_expert_num": ("ACCELERATE_KT_LORA_EXPERT_NUM", int),
@@ -110,18 +111,22 @@ class HfTrainerKTConfig:
         return True if enabled is None else bool(enabled)
 
     @property
-    def kt_weight_path(self) -> Optional[str]:
+    def kt_weight_path(self) -> str | None:
         return self._get("kt_weight_path", None)
 
     @property
-    def kt_skip_expert_loading(self) -> Optional[bool]:
+    def kt_non_expert_weight_path(self) -> str | None:
+        return self._get("kt_non_expert_weight_path", None)
+
+    @property
+    def kt_skip_expert_loading(self) -> bool | None:
         # If the user explicitly configured it, respect it.
         explicit = self._get("kt_skip_expert_loading", None)
         if explicit is not None:
             return bool(explicit)
         # Default: when KT is enabled, we skip expert loading and expect a later KT wrapper to load experts
         # from `kt_weight_path` or via on-the-fly conversion from checkpoint shards.
-        return True if self.enabled else False
+        return bool(self.enabled)
 
 
 def set_kt_config(kt_config: Any) -> None:
@@ -134,7 +139,7 @@ def unset_kt_config() -> None:
     _kt_config_weak_ref = None
 
 
-def _get_kt_config() -> Optional[Any]:
+def _get_kt_config() -> Any | None:
     if _kt_config_weak_ref is None:
         return None
     return _kt_config_weak_ref()
