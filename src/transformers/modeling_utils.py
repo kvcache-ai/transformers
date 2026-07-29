@@ -4399,7 +4399,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                             size=param.shape,
                             stride=[0] * len(param.shape),
                         )
-                        setattr(module, param_name, nn.Parameter(fake_tensor, requires_grad=False))
+                        placeholder = nn.Parameter(fake_tensor, requires_grad=False)
+                        placeholder._kt_zero_storage_placeholder = True
+                        setattr(module, param_name, placeholder)
                     module._is_hf_initialized = True
 
         try:

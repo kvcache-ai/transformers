@@ -322,14 +322,28 @@ def _get_kt_fsdp2_peft_state_dict(model: nn.Module) -> dict[str, Any]:
     """Gather only trainable PEFT state for a KT FSDP2 adapter save."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-    return get_model_state_dict(
-        model,
-        options=StateDictOptions(
-            full_state_dict=True,
-            cpu_offload=True,
-            ignore_frozen_params=True,
-        ),
-    )
+    placeholders = [
+        parameter
+        for parameter in model.parameters()
+        if not parameter.requires_grad and getattr(parameter, "_kt_zero_storage_placeholder", False)
+    ]
+    try:
+        # DCP assumes every frozen parameter is present in model.state_dict().
+        # KT placeholders are intentionally omitted, so keep them out of DCP's
+        # frozen-parameter filtering while it gathers the actual PEFT tensors.
+        for parameter in placeholders:
+            parameter.requires_grad_(True)
+        return get_model_state_dict(
+            model,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+                ignore_frozen_params=True,
+            ),
+        )
+    finally:
+        for parameter in placeholders:
+            parameter.requires_grad_(False)
 
 
 def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:

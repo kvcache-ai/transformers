@@ -196,6 +196,32 @@ class TrainerKTAdapterReloadTest(unittest.TestCase):
         self.assertEqual(set(state_dict), {"bias"})
         self.assertEqual(state_dict["bias"].device.type, "cpu")
 
+    def test_fsdp2_adapter_save_tolerates_omitted_kt_placeholders(self):
+        class ModelWithKTPlaceholder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lora = torch.nn.Parameter(torch.ones(2, 2))
+                storage = torch.UntypedStorage(1, device="cpu")
+                tensor = torch.tensor([], dtype=torch.bfloat16).set_(
+                    storage,
+                    storage_offset=0,
+                    size=(8, 8),
+                    stride=(0, 0),
+                )
+                self.expert = torch.nn.Parameter(tensor, requires_grad=False)
+                self.expert._kt_zero_storage_placeholder = True
+
+                def omit_expert(_module, state, _prefix, _metadata):
+                    state.pop("expert")
+
+                self._register_state_dict_hook(omit_expert)
+
+        model = ModelWithKTPlaceholder()
+        state_dict = _get_kt_fsdp2_peft_state_dict(model)
+
+        self.assertEqual(set(state_dict), {"lora"})
+        self.assertFalse(model.expert.requires_grad)
+
     def test_loads_fresh_adapter_after_kt_adaptation(self):
         model = SimpleNamespace(_kt_adapter_path=Path("/tmp/adapter"))
 
