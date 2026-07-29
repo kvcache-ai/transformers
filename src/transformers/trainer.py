@@ -322,11 +322,20 @@ def _get_kt_fsdp2_peft_state_dict(model: nn.Module) -> dict[str, Any]:
     """Gather only trainable PEFT state for a KT FSDP2 adapter save."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
+    def is_kt_placeholder(parameter: nn.Parameter) -> bool:
+        if getattr(parameter, "_kt_zero_storage_placeholder", False):
+            return True
+        if parameter.device.type != "cpu" or parameter.numel() == 0 or any(parameter.stride()):
+            return False
+        try:
+            return parameter.untyped_storage().nbytes() < parameter.numel() * parameter.element_size()
+        except (NotImplementedError, RuntimeError):
+            return False
+
     placeholders = [
-        parameter
-        for parameter in model.parameters()
-        if not parameter.requires_grad and getattr(parameter, "_kt_zero_storage_placeholder", False)
+        parameter for parameter in model.parameters() if not parameter.requires_grad and is_kt_placeholder(parameter)
     ]
+    logger.info(f"Excluding {len(placeholders)} zero-storage KT placeholders from DCP frozen-parameter filtering")
     try:
         # DCP assumes every frozen parameter is present in model.state_dict().
         # KT placeholders are intentionally omitted, so keep them out of DCP's

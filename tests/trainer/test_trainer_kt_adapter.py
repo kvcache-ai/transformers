@@ -209,7 +209,6 @@ class TrainerKTAdapterReloadTest(unittest.TestCase):
                     stride=(0, 0),
                 )
                 self.expert = torch.nn.Parameter(tensor, requires_grad=False)
-                self.expert._kt_zero_storage_placeholder = True
 
                 def omit_expert(_module, state, _prefix, _metadata):
                     state.pop("expert")
