@@ -201,6 +201,8 @@ class TrainerKTAdapterReloadTest(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.lora = torch.nn.Parameter(torch.ones(2, 2))
+                self.mlp = torch.nn.Module()
+                self.mlp.experts = torch.nn.Module()
                 storage = torch.UntypedStorage(1, device="cpu")
                 tensor = torch.tensor([], dtype=torch.bfloat16).set_(
                     storage,
@@ -208,10 +210,10 @@ class TrainerKTAdapterReloadTest(unittest.TestCase):
                     size=(8, 8),
                     stride=(0, 0),
                 )
-                self.expert = torch.nn.Parameter(tensor, requires_grad=False)
+                self.mlp.experts.gate_up_proj = torch.nn.Parameter(tensor, requires_grad=False)
 
                 def omit_expert(_module, state, _prefix, _metadata):
-                    state.pop("expert")
+                    state.pop("mlp.experts.gate_up_proj")
 
                 self._register_state_dict_hook(omit_expert)
 
@@ -219,7 +221,7 @@ class TrainerKTAdapterReloadTest(unittest.TestCase):
         state_dict = _get_kt_fsdp2_peft_state_dict(model)
 
         self.assertEqual(set(state_dict), {"lora"})
-        self.assertFalse(model.expert.requires_grad)
+        self.assertFalse(model.mlp.experts.gate_up_proj.requires_grad)
 
     def test_loads_fresh_adapter_after_kt_adaptation(self):
         model = SimpleNamespace(_kt_adapter_path=Path("/tmp/adapter"))

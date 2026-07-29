@@ -322,7 +322,9 @@ def _get_kt_fsdp2_peft_state_dict(model: nn.Module) -> dict[str, Any]:
     """Gather only trainable PEFT state for a KT FSDP2 adapter save."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-    def is_kt_placeholder(parameter: nn.Parameter) -> bool:
+    def is_kt_placeholder(name: str, parameter: nn.Parameter) -> bool:
+        if name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")):
+            return True
         if getattr(parameter, "_kt_zero_storage_placeholder", False):
             return True
         if parameter.device.type != "cpu" or parameter.numel() == 0 or any(parameter.stride()):
@@ -333,7 +335,9 @@ def _get_kt_fsdp2_peft_state_dict(model: nn.Module) -> dict[str, Any]:
             return False
 
     placeholders = [
-        parameter for parameter in model.parameters() if not parameter.requires_grad and is_kt_placeholder(parameter)
+        parameter
+        for name, parameter in model.named_parameters()
+        if not parameter.requires_grad and is_kt_placeholder(name, parameter)
     ]
     logger.info(f"Excluding {len(placeholders)} zero-storage KT placeholders from DCP frozen-parameter filtering")
     try:
