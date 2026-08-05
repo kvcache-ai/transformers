@@ -16,7 +16,17 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from transformers.integrations.kt import HfTrainerKTConfig, _validate_kt_int8_loading_info, unset_kt_config
+import torch
+
+from transformers.integrations.kt import (
+    HfTrainerKTConfig,
+    _validate_kt_int8_loading_info,
+    _validate_kt_prequantized_loading_info,
+    is_kt_fp8_expert_loading_enabled,
+    is_kt_prequantized_expert_loading_enabled,
+    unset_kt_config,
+)
+from transformers.modeling_utils import get_total_byte_count
 from transformers.utils.loading_report import LoadStateDictInfo
 
 
@@ -119,6 +129,62 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "missing_keys"):
                 _validate_kt_int8_loading_info(_loading_info(missing_keys={"model.layers.3.self_attn.q_proj.weight"}))
+
+    def test_fp8_uses_the_same_strict_non_expert_contract(self):
+        self.kt_config = HfTrainerKTConfig(
+            {
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_expert_weight_format": "fp8",
+            }
+        )
+
+        self.assertTrue(is_kt_fp8_expert_loading_enabled())
+        self.assertTrue(is_kt_prequantized_expert_loading_enabled())
+        _validate_kt_prequantized_loading_info(
+            _loading_info(missing_keys={"model.layers.3.mlp.experts.0.gate_proj.weight"})
+        )
+        with self.assertRaisesRegex(RuntimeError, "KT FP8.*missing_keys"):
+            _validate_kt_prequantized_loading_info(
+                _loading_info(missing_keys={"model.layers.3.self_attn.q_proj.weight"})
+            )
+
+    def test_fp8_lora_dropout_is_loaded_from_environment(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "ACCELERATE_USE_KT": "true",
+                "ACCELERATE_KT_EXPERT_WEIGHT_FORMAT": "fp8",
+                "ACCELERATE_KT_LORA_DROPOUT": "0.125",
+            },
+            clear=False,
+        ):
+            self.kt_config = HfTrainerKTConfig({"enabled": True})
+
+        self.assertAlmostEqual(self.kt_config.kt_lora_dropout, 0.125)
+
+    def test_fp8_routed_experts_are_excluded_from_allocator_warmup(self):
+        self.kt_config = HfTrainerKTConfig(
+            {
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_expert_weight_format": "fp8",
+            }
+        )
+        parameters = {
+            "model.layers.3.mlp.experts.0.gate_proj.weight": torch.empty(1024, dtype=torch.bfloat16),
+            "model.layers.3.self_attn.q_proj.weight": torch.empty(8, dtype=torch.bfloat16),
+        }
+        model = SimpleNamespace(
+            all_tied_weights_keys={},
+            _tp_plan=None,
+            get_parameter_or_buffer=parameters.__getitem__,
+        )
+        device_map = dict.fromkeys(parameters, "cuda:0")
+
+        warmup_bytes = get_total_byte_count(model, device_map)
+
+        self.assertEqual(warmup_bytes["cuda:0"], 16)
 
 
 if __name__ == "__main__":

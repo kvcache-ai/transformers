@@ -49,6 +49,7 @@ class HfTrainerKTConfig:
         "kt_lora_expert_intermediate_size": ("ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE", int),
         "kt_lora_rank": ("ACCELERATE_KT_LORA_RANK", int),
         "kt_lora_alpha": ("ACCELERATE_KT_LORA_ALPHA", float),
+        "kt_lora_dropout": ("ACCELERATE_KT_LORA_DROPOUT", float),
         "kt_model_max_length": ("ACCELERATE_KT_MODEL_MAX_LENGTH", int),
         "kt_skip_expert_loading": ("ACCELERATE_KT_SKIP_EXPERT_LOADING", bool),
     }
@@ -171,22 +172,42 @@ _KT_ROUTED_EXPERT_KEY = re.compile(r"\.experts\.(?:\d+\.|gate_up_proj|down_proj|
 _DEEPSEEK_V3_MTP_KEY = re.compile(r"^model\.layers\.61\.")
 
 
+def is_kt_routed_expert_parameter_name(name: str) -> bool:
+    return _KT_ROUTED_EXPERT_KEY.search(name) is not None
+
+
 def is_kt_int8_expert_loading_enabled() -> bool:
     """Whether checkpoint expert tensors are replaced by pre-quantized KT INT8 weights."""
-    if not is_kt_expert_loading_enabled():
-        return False
+    return _get_kt_expert_weight_format() == "int8" and is_kt_expert_loading_enabled()
 
+
+def is_kt_fp8_expert_loading_enabled() -> bool:
+    """Whether checkpoint routed experts remain in native block-FP8 storage owned by KT."""
+    return _get_kt_expert_weight_format() == "fp8" and is_kt_expert_loading_enabled()
+
+
+def is_kt_prequantized_expert_loading_enabled() -> bool:
+    """Whether KT replaces checkpoint routed experts with a supported pre-quantized backend."""
+    return _get_kt_expert_weight_format() in {"int8", "fp8"} and is_kt_expert_loading_enabled()
+
+
+def _get_kt_expert_weight_format() -> str | None:
     kt_config = _get_kt_config()
     weight_format = getattr(kt_config, "kt_expert_weight_format", None) if kt_config is not None else None
     if weight_format is None:
         weight_format = os.environ.get("ACCELERATE_KT_EXPERT_WEIGHT_FORMAT")
-    return isinstance(weight_format, str) and weight_format.lower() == "int8"
+    if not isinstance(weight_format, str):
+        return None
+    return weight_format.strip().lower()
 
 
-def _validate_kt_int8_loading_info(loading_info: Any, model: Any | None = None) -> None:
-    """Fail closed when a KT INT8 checkpoint did not fully populate the non-expert model."""
-    if not is_kt_int8_expert_loading_enabled():
+def _validate_kt_prequantized_loading_info(loading_info: Any, model: Any | None = None) -> None:
+    """Fail closed when KT skipped routed experts but did not fully populate the non-expert model."""
+    if not is_kt_prequantized_expert_loading_enabled():
         return
+
+    weight_format = _get_kt_expert_weight_format()
+    format_label = weight_format.upper() if weight_format is not None else "PREQUANTIZED"
 
     config = getattr(model, "config", None)
     allow_deepseek_mtp = (
@@ -218,5 +239,11 @@ def _validate_kt_int8_loading_info(loading_info: Any, model: Any | None = None) 
 
     if failures:
         raise RuntimeError(
-            "KT INT8 checkpoint loading requires an exact non-expert model match; " + "; ".join(failures)
+            f"KT {format_label} checkpoint loading requires an exact non-expert model match; "
+            + "; ".join(failures)
         )
+
+
+def _validate_kt_int8_loading_info(loading_info: Any, model: Any | None = None) -> None:
+    """Backward-compatible alias for callers that still use the INT8-specific validator name."""
+    _validate_kt_prequantized_loading_info(loading_info, model)

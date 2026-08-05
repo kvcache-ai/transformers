@@ -4434,9 +4434,9 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 logger=logger,
             )
 
-        from .integrations.kt import _validate_kt_int8_loading_info
+        from .integrations.kt import _validate_kt_prequantized_loading_info
 
-        _validate_kt_int8_loading_info(loading_info, model)
+        _validate_kt_prequantized_loading_info(loading_info, model)
         return loading_info
 
     def retrieve_modules_from_names(self, names, add_prefix=False, remove_prefix=False):
@@ -4888,7 +4888,10 @@ def get_total_byte_count(
     total_byte_count = defaultdict(lambda: 0)
     tied_param_names = model.all_tied_weights_keys.keys()
     tp_plan = model._tp_plan if torch.distributed.is_available() and torch.distributed.is_initialized() else []
+    from .integrations.kt import is_kt_expert_loading_enabled, is_kt_routed_expert_parameter_name
     from .integrations.kt_artifacts import is_kt_int8_routed_expert_base_parameter
+
+    skip_kt_routed_experts = is_kt_expert_loading_enabled()
 
     for param_name, device in accelerator_device_map.items():
         # Skip if the parameter has already been accounted for (tied weights)
@@ -4897,7 +4900,9 @@ def get_total_byte_count(
 
         param = model.get_parameter_or_buffer(param_name)
 
-        if is_kt_int8_routed_expert_base_parameter(param):
+        if is_kt_int8_routed_expert_base_parameter(param) or (
+            skip_kt_routed_experts and is_kt_routed_expert_parameter_name(param_name)
+        ):
             continue
         if hf_quantizer is not None:
             dtype_size = hf_quantizer.param_element_size(model, param_name, param)
