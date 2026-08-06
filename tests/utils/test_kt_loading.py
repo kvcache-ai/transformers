@@ -175,17 +175,28 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
             "model.layers.3.mlp.experts.0.gate_proj.weight": torch.empty(1024, dtype=torch.bfloat16),
             "model.layers.3.self_attn.q_proj.weight": torch.empty(8, dtype=torch.bfloat16),
         }
-        model = SimpleNamespace(
-            all_tied_weights_keys={},
-            config=SimpleNamespace(model_type="deepseek_v3"),
-            _tp_plan=None,
-            get_parameter_or_buffer=parameters.__getitem__,
-        )
         device_map = dict.fromkeys(parameters, "cuda:0")
 
-        warmup_bytes = get_total_byte_count(model, device_map)
+        for architecture in (
+            "DeepseekV2ForCausalLM",
+            "DeepseekV3ForCausalLM",
+            "Qwen2MoeForCausalLM",
+            "Qwen3MoeForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Glm4MoeForCausalLM",
+            "MixtralForCausalLM",
+        ):
+            with self.subTest(architecture=architecture):
+                model = SimpleNamespace(
+                    all_tied_weights_keys={},
+                    config=SimpleNamespace(architectures=[architecture]),
+                    _tp_plan=None,
+                    get_parameter_or_buffer=parameters.__getitem__,
+                )
 
-        self.assertEqual(warmup_bytes["cuda:0"], 16)
+                warmup_bytes = get_total_byte_count(model, device_map)
+
+                self.assertEqual(warmup_bytes["cuda:0"], 16)
 
 
 if __name__ == "__main__":

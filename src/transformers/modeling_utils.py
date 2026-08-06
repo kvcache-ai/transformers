@@ -4888,13 +4888,14 @@ def get_total_byte_count(
     total_byte_count = defaultdict(lambda: 0)
     tied_param_names = model.all_tied_weights_keys.keys()
     tp_plan = model._tp_plan if torch.distributed.is_available() and torch.distributed.is_initialized() else []
-    from .integrations.kt import is_kt_expert_loading_enabled, is_kt_routed_expert_parameter_name
+    from .integrations.kt import (
+        is_kt_expert_loading_enabled,
+        is_kt_routed_expert_parameter_name,
+        is_kt_supported_moe_model,
+    )
     from .integrations.kt_artifacts import is_kt_int8_routed_expert_base_parameter
 
-    skip_kt_routed_experts = (
-        is_kt_expert_loading_enabled()
-        and getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v3"
-    )
+    skip_kt_routed_experts = is_kt_expert_loading_enabled() and is_kt_supported_moe_model(model)
 
     for param_name, device in accelerator_device_map.items():
         # Skip if the parameter has already been accounted for (tied weights)

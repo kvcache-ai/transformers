@@ -618,6 +618,7 @@ class KTNonExpertCacheTest(unittest.TestCase):
             }
         )
         model = _TinyDeepseekForCausalLM(model_type="ordinary")
+        model.config.architectures = ["OrdinaryMoeForCausalLM"]
         self.assertEqual(mark_kt_int8_routed_expert_base_parameters(model, SimpleNamespace()), ())
 
         full_bytes = sum(parameter.numel() * parameter.element_size() for parameter in model.parameters())

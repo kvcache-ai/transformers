@@ -170,6 +170,26 @@ def is_kt_expert_loading_enabled() -> bool:
 
 _KT_ROUTED_EXPERT_KEY = re.compile(r"\.experts\.(?:\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)")
 _DEEPSEEK_V3_MTP_KEY = re.compile(r"^model\.layers\.61\.")
+_KT_SUPPORTED_MOE_ARCHITECTURES = (
+    "DeepseekV2",
+    "DeepseekV3",
+    "Qwen2Moe",
+    "Qwen3Moe",
+    "Qwen3_5Moe",
+    "Glm4Moe",
+    "Mixtral",
+)
+
+
+def is_kt_supported_moe_model(model: Any) -> bool:
+    config = getattr(model, "config", None)
+    architectures = getattr(config, "architectures", None)
+    if not isinstance(architectures, (list, tuple)):
+        return False
+    return any(
+        isinstance(architecture, str) and any(marker in architecture for marker in _KT_SUPPORTED_MOE_ARCHITECTURES)
+        for architecture in architectures
+    )
 
 
 def is_kt_routed_expert_parameter_name(name: str) -> bool:
