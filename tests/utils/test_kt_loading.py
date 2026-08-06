@@ -177,6 +177,7 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
         }
         model = SimpleNamespace(
             all_tied_weights_keys={},
+            config=SimpleNamespace(model_type="deepseek_v3"),
             _tp_plan=None,
             get_parameter_or_buffer=parameters.__getitem__,
         )
