@@ -1706,8 +1706,9 @@ class TrainingArguments:
     ):
         """Atomically configure KTransformers for model loading and training.
 
-        The input mapping is never mutated. The normalized copy is shared by `kt_config`, `hf_kt_config`, and
-        `AcceleratorConfig`, so callers do not need to write Transformers private attributes.
+        The input mapping is never mutated. Its normalized copy, or the original typed KTConfig, is shared by
+        `kt_config`, `hf_kt_config`, and `AcceleratorConfig`, so callers do not need to write Transformers private
+        attributes.
         """
         if not is_accelerate_available():
             raise ValueError(
@@ -2189,6 +2190,10 @@ class TrainingArguments:
         d = {field.name: getattr(self, field.name) for field in fields(self) if field.init}
 
         for k, v in d.items():
+            if k == "kt_config" and v is not None:
+                from .integrations.kt import _serialize_kt_config
+
+                d[k] = _serialize_kt_config(v)
             if isinstance(v, Enum):
                 d[k] = v.value
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], Enum):

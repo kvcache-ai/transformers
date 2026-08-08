@@ -34,6 +34,11 @@ from transformers.integrations.kt import (
 from transformers.trainer import Trainer
 
 
+def kt_owned_config(config_type):
+    config_type.__module__ = "kt_kernel.sft.config"
+    return config_type
+
+
 class TrainingArgumentsKTConfigTest(unittest.TestCase):
     def tearDown(self):
         unset_kt_config()
@@ -86,6 +91,7 @@ class TrainingArgumentsKTConfigTest(unittest.TestCase):
 
         self.assertEqual(json_handle.kt_backend, "AMXBF16")
 
+        @kt_owned_config
         @dataclass
         class KTConfig:
             kt_backend: str = "auto"
@@ -95,8 +101,66 @@ class TrainingArgumentsKTConfigTest(unittest.TestCase):
         typed_handle = configure_kt(typed_config)
 
         self.assertEqual(typed_config, KTConfig())
-        self.assertEqual(typed_handle.config, {"kt_backend": "auto", "kt_lora_rank": 8})
+        self.assertIs(typed_handle.config, typed_config)
         self.assertIs(_get_kt_config(), typed_handle)
+
+    def test_typed_config_contract_rejects_name_only_classes_and_class_objects(self):
+        @dataclass
+        class KTConfig:
+            kt_backend: str = "AMXBF16"
+
+        with self.assertRaisesRegex(TypeError, "kt_kernel.sft.config.KTConfig"):
+            configure_kt(KTConfig())
+
+        KTConfig.__module__ = "kt_kernel.sft.config"
+        with self.assertRaisesRegex(TypeError, "an instance of kt_kernel.sft.config.KTConfig"):
+            configure_kt(KTConfig)
+
+        @dataclass
+        class Impostor:
+            kt_backend: str = "AMXBF16"
+
+        Impostor.__module__ = "kt_kernel.sft.config"
+        with self.assertRaisesRegex(TypeError, "got .*Impostor"):
+            configure_kt(Impostor())
+
+    def test_typed_config_identity_survives_runtime_metadata_and_activation_environment(self):
+        post_init_calls = []
+
+        @kt_owned_config
+        @dataclass
+        class KTConfig:
+            kt_activation_policy: dict[str, str] | None = None
+            kt_checkpoint_files: list[str] | None = None
+            kt_sharded_metadata: dict | None = None
+
+            def __post_init__(self):
+                post_init_calls.append(self)
+                if self.kt_activation_policy is not None and os.environ.get("ACCELERATE_KT_ACTIVATION_POLICY"):
+                    raise ValueError("activation policy was reconstructed under a conflicting environment")
+
+        config = KTConfig(kt_activation_policy={"cpu": "retain", "gpu": "recompute"})
+        with patch.dict(
+            os.environ,
+            {"ACCELERATE_KT_ACTIVATION_POLICY": '{"cpu":"recompute","gpu":"recompute"}'},
+        ):
+            handle = configure_kt(config)
+            handle.set_runtime_metadata(
+                kt_checkpoint_files=["model-00001-of-00002.safetensors"],
+                kt_sharded_metadata={"weight_map": {"model.layers.0.mlp.experts": "model-00001-of-00002.safetensors"}},
+            )
+
+            nested_config = handle.config
+            resolved_config = nested_config if isinstance(nested_config, KTConfig) else KTConfig(**nested_config)
+
+        self.assertIs(nested_config, config)
+        self.assertIs(resolved_config, config)
+        self.assertEqual(post_init_calls, [config])
+        self.assertEqual(handle.kt_checkpoint_files, ["model-00001-of-00002.safetensors"])
+        self.assertEqual(
+            handle.kt_sharded_metadata,
+            {"weight_map": {"model.layers.0.mlp.experts": "model-00001-of-00002.safetensors"}},
+        )
 
     def test_ordinary_arguments_supersede_live_transformers_owned_kt_state(self):
         kt_args = TrainingArguments(
@@ -151,6 +215,7 @@ class TrainingArgumentsKTConfigTest(unittest.TestCase):
         self.assertIs(args.hf_kt_config, previous_wrapper)
 
     def test_accepts_typed_kt_config_without_mutating_it(self):
+        @kt_owned_config
         @dataclass
         class KTConfig:
             kt_backend: str = "AMXBF16"
@@ -160,8 +225,43 @@ class TrainingArgumentsKTConfigTest(unittest.TestCase):
         args = self.make_args().update_kt_config(config)
 
         self.assertEqual(config, KTConfig())
-        self.assertEqual(args.kt_config["kt_backend"], "AMXBF16")
-        self.assertEqual(args.kt_config["kt_lora_rank"], 8)
+        self.assertIs(args.kt_config, config)
+        self.assertIs(args.hf_kt_config.config, config)
+        self.assertIs(args.accelerator_config.kt_config, config)
+        self.assertEqual(args.kt_config.kt_backend, "AMXBF16")
+        self.assertEqual(args.kt_config.kt_lora_rank, 8)
+
+    def test_typed_kt_config_serializes_without_changing_runtime_identity(self):
+        @dataclass(frozen=True)
+        class KTActivationPolicy:
+            cpu: str = "retain"
+            gpu: str = "recompute"
+
+        @kt_owned_config
+        @dataclass
+        class KTConfig:
+            kt_backend: str = "AMXBF16"
+            kt_lora_rank: int = 8
+            kt_activation_policy: KTActivationPolicy = KTActivationPolicy()
+
+        config = KTConfig()
+        args = self.make_args().update_kt_config(config)
+        expected = {
+            "kt_backend": "AMXBF16",
+            "kt_lora_rank": 8,
+            "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
+        }
+
+        payload = args.to_dict()
+        json_payload = json.loads(args.to_json_string())
+
+        self.assertEqual(payload["kt_config"], expected)
+        self.assertEqual(payload["accelerator_config"]["kt_config"], expected)
+        self.assertEqual(json_payload["kt_config"], expected)
+        self.assertEqual(json_payload["accelerator_config"]["kt_config"], expected)
+        self.assertIs(args.kt_config, config)
+        self.assertIs(args.hf_kt_config.config, config)
+        self.assertIs(args.accelerator_config.kt_config, config)
 
     def test_wrapper_replace_copies_mapping_and_clears_runtime_metadata(self):
         original = {"kt_backend": "AMXBF16"}
@@ -208,6 +308,45 @@ class TrainingArgumentsKTConfigTest(unittest.TestCase):
 
         self.assertFalse(plugin.enabled)
         self.assertEqual(plugin.kt_config, {"kt_backend": "AMXBF16", "kt_lora_rank": 8})
+
+    def test_trainer_forwards_validated_typed_config_to_plugin_by_identity(self):
+        @kt_owned_config
+        @dataclass
+        class KTConfig:
+            kt_backend: str = "AMXBF16"
+
+        class Plugin:
+            def __init__(self, *, enabled, kt_config):
+                self.enabled = enabled
+                self.kt_config = kt_config
+
+        typed_config = KTConfig()
+        hf_kt_config = configure_kt(typed_config)
+        trainer = object.__new__(Trainer)
+        trainer.model = torch.nn.Linear(2, 2)
+        trainer.args = SimpleNamespace(
+            mixed_precision="bf16",
+            deepspeed_plugin=None,
+            ddp_find_unused_parameters=None,
+            gradient_checkpointing=False,
+            ddp_bucket_cap_mb=None,
+            ddp_broadcast_buffers=None,
+            parallelism_config=None,
+            torch_compile_backend=None,
+            torch_compile_mode=None,
+            hf_kt_config=hf_kt_config,
+            accelerator_config=SimpleNamespace(kt_config=typed_config),
+        )
+
+        with (
+            patch("transformers.trainer.is_accelerate_available", return_value=False),
+            patch("transformers.trainer._accelerate_supports_kt_config", True),
+            patch("transformers.trainer.KTransformersPlugin", Plugin),
+        ):
+            plugin = trainer._build_accelerator_args()["kt_config"]
+
+        self.assertTrue(plugin.enabled)
+        self.assertIs(plugin.kt_config, typed_config)
 
 
 if __name__ == "__main__":

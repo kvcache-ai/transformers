@@ -891,8 +891,16 @@ class Trainer:
                 args["kt_config"] = KTransformersPlugin(enabled=enabled, kt_config=kernel_config)
             elif isinstance(kt_config_dict, KTransformersPlugin):
                 args["kt_config"] = kt_config_dict
+            elif (
+                getattr(self.args, "hf_kt_config", None) is not None
+                and self.args.hf_kt_config.config is kt_config_dict
+            ):
+                args["kt_config"] = KTransformersPlugin(
+                    enabled=self.args.hf_kt_config.enabled,
+                    kt_config=kt_config_dict,
+                )
             else:
-                raise TypeError("`kt_config` must be a dict or KTransformersPlugin instance.")
+                raise TypeError("`kt_config` must be a dict, KTConfig, or KTransformersPlugin instance.")
 
         return args
 

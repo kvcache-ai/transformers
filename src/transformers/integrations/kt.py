@@ -17,12 +17,14 @@ import json
 import os
 import weakref
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 
 _kt_config_weak_ref: weakref.ReferenceType | None = None
 _kt_environment_owner_ref: weakref.ReferenceType | None = None
+_KT_CONFIG_MODULE = "kt_kernel.sft.config"
+_KT_CONFIG_CLASS = "KTConfig"
 
 
 def _clear_collected_kt_state(reference: weakref.ReferenceType) -> None:
@@ -124,6 +126,26 @@ class HfTrainerKTConfig:
         return bool(self.enabled)
 
 
+def _is_typed_kt_config(config: Any) -> bool:
+    """Recognize KT's public config type without importing the optional package."""
+
+    config_type = type(config)
+    return (
+        not isinstance(config, type)
+        and is_dataclass(config)
+        and config_type.__module__ == _KT_CONFIG_MODULE
+        and config_type.__name__ == _KT_CONFIG_CLASS
+    )
+
+
+def _serialize_kt_config(config: Any) -> Any:
+    """Convert a typed KT config only at a public serialization boundary."""
+
+    if _is_typed_kt_config(config):
+        return asdict(config)
+    return copy.deepcopy(config)
+
+
 def _normalize_kt_config(config: Any) -> Any:
     """Normalize public KT inputs without mutating the caller's object."""
     if isinstance(config, str):
@@ -133,9 +155,14 @@ def _normalize_kt_config(config: Any) -> Any:
         return {}
     if isinstance(config, Mapping):
         return dict(config)
-    if is_dataclass(config) and type(config).__name__ == "KTConfig":
-        return {field.name: getattr(config, field.name) for field in fields(config)}
-    raise TypeError(f"`config` must be a mapping, KTConfig, JSON path, or None, got {type(config).__name__}.")
+    if _is_typed_kt_config(config):
+        return config
+    received_type = type(config)
+    raise TypeError(
+        "`config` must be a mapping, JSON path, None, or an instance of "
+        f"{_KT_CONFIG_MODULE}.{_KT_CONFIG_CLASS}; got "
+        f"{received_type.__module__}.{received_type.__qualname__}."
+    )
 
 
 def configure_kt(config: Any) -> HfTrainerKTConfig:
