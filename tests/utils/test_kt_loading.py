@@ -14,10 +14,11 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
+from transformers import BertConfig, BertModel
 from transformers.integrations.kt import (
     HfTrainerKTConfig,
     _validate_kt_int8_loading_info,
@@ -150,6 +151,98 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
 
         with self.assertRaises(AttributeError):
             _ = self.kt_config.kt_lora_dropout
+
+    def test_bf16_claim_precedes_device_map_without_a_load_plan(self):
+        self.kt_config = HfTrainerKTConfig(
+            {
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_expert_weight_format": "bf16",
+            }
+        )
+        config = BertConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            vocab_size=32,
+        )
+        source = BertModel(config)
+        events = []
+
+        def claim(model):
+            events.append(("claim", model))
+            unset_kt_config()
+            return ()
+
+        def get_device_map(model, device_map, max_memory, hf_quantizer):
+            events.append(("device_map", model))
+            return device_map
+
+        with (
+            patch("transformers.integrations.kt_artifacts.claim_kt_routed_expert_subtrees", side_effect=claim),
+            patch("transformers.modeling_utils._get_device_map", side_effect=get_device_map),
+        ):
+            loaded = BertModel.from_pretrained(
+                None,
+                config=config,
+                state_dict=source.state_dict(),
+                device_map={"": "cpu"},
+            )
+
+        self.assertEqual([event for event, _ in events], ["claim", "device_map"])
+        self.assertIs(events[0][1], loaded)
+        self.assertIs(events[1][1], loaded)
+
+    def test_kt_finalize_keeps_ordinary_missing_meta_in_the_standard_path(self):
+        self.kt_config = HfTrainerKTConfig(
+            {
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_expert_weight_format": "bf16",
+            }
+        )
+        expert_key = "model.layers.0.mlp.experts.gate_up_proj"
+        ordinary_key = "model.layers.0.self_attn.q_proj.weight"
+        expert_module = SimpleNamespace(
+            gate_up_proj=torch.nn.Parameter(torch.empty(2, 2, device="meta")),
+        )
+        model = SimpleNamespace(
+            get_submodule=Mock(return_value=expert_module),
+            mark_tied_weights_as_initialized=Mock(),
+            _move_missing_keys_from_meta_to_device=Mock(),
+            _initialize_missing_keys=Mock(),
+            tie_weights=Mock(),
+            _adjust_missing_and_unexpected_keys=Mock(),
+        )
+        load_config = SimpleNamespace(
+            device_map=None,
+            device_mesh=None,
+            hf_quantizer=None,
+            is_quantized=False,
+            pretrained_model_name_or_path="test-model",
+            ignore_mismatched_sizes=False,
+        )
+        loading_info = _loading_info(missing_keys={expert_key, ordinary_key})
+
+        with (
+            patch(
+                "transformers.integrations.kt.is_kt_routed_expert_parameter_name",
+                side_effect=lambda name: name == expert_key,
+            ),
+            patch("transformers.modeling_utils.log_state_dict_report"),
+        ):
+            result = PreTrainedModel._finalize_model_loading(model, load_config, loading_info)
+
+        self.assertIs(result, loading_info)
+        self.assertEqual(loading_info.missing_keys, {ordinary_key})
+        self.assertEqual(expert_module.gate_up_proj.device.type, "cpu")
+        model._move_missing_keys_from_meta_to_device.assert_called_once_with(
+            {ordinary_key},
+            None,
+            None,
+            None,
+        )
 
     def test_fp8_routed_experts_are_excluded_from_allocator_warmup(self):
         self.kt_config = HfTrainerKTConfig(

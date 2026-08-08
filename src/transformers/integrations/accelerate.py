@@ -351,9 +351,9 @@ def _get_device_map(
     """
     inferred_device_map = isinstance(device_map, str)
     if inferred_device_map:
-        from .kt_artifacts import project_kt_int8_routed_experts_out_of_device_map
+        from .kt_artifacts import project_kt_routed_experts_out_of_device_map
 
-        with project_kt_int8_routed_experts_out_of_device_map(model):
+        with project_kt_routed_experts_out_of_device_map(model):
             no_split_modules = model._no_split_modules
 
             if device_map != "sequential":
@@ -377,9 +377,9 @@ def _get_device_map(
                 hf_quantizer=hf_quantizer,
             )
 
-    from .kt_artifacts import prepare_kt_int8_non_expert_device_map
+    from .kt_artifacts import prepare_kt_non_expert_device_map
 
-    device_map = prepare_kt_int8_non_expert_device_map(model, device_map)
+    device_map = prepare_kt_non_expert_device_map(model, device_map)
     if inferred_device_map and hf_quantizer is not None:
         hf_quantizer.validate_environment(device_map=device_map)
 
@@ -388,11 +388,11 @@ def _get_device_map(
 
 def accelerate_dispatch(model, hf_quantizer, device_map, offload_folder, offload_index, offload_buffers):
     from .kt_artifacts import (
-        hide_kt_int8_routed_experts_from_dispatch,
-        prepare_kt_int8_non_expert_device_map,
+        hide_kt_routed_experts_from_dispatch,
+        prepare_kt_non_expert_device_map,
     )
 
-    device_map = prepare_kt_int8_non_expert_device_map(model, device_map)
+    device_map = prepare_kt_non_expert_device_map(model, device_map)
     device_map_kwargs = {
         "device_map": device_map,
         "offload_dir": offload_folder,
@@ -417,7 +417,7 @@ def accelerate_dispatch(model, hf_quantizer, device_map, offload_folder, offload
         device_map_kwargs["offload_buffers"] = True
 
     if not is_fsdp_enabled() and not is_deepspeed_zero3_enabled():
-        with hide_kt_int8_routed_experts_from_dispatch(model):
+        with hide_kt_routed_experts_from_dispatch(model):
             dispatch_model(model, **device_map_kwargs)
 
 

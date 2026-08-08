@@ -34,6 +34,15 @@ def _artifacts_api():
     return artifacts
 
 
+def _active_artifacts_api():
+    """Resolve KT's artifact API only while routed experts are KT-owned."""
+    from .kt import is_kt_expert_loading_enabled
+
+    if not is_kt_expert_loading_enabled():
+        return None
+    return _artifacts_api()
+
+
 def resolve_kt_pretrained_artifacts(
     source_model_name_or_path: str,
     explicit_quantization_config: Any | None,
@@ -54,6 +63,14 @@ def validate_kt_pretrained_load(plan: Any, loading_info: Any, model: Any) -> Non
         _artifacts_api().validate_kt_pretrained_load(plan, loading_info, model)
 
 
+def claim_kt_routed_expert_subtrees(model: Any) -> tuple[str, ...]:
+    """Let KT claim its routed-expert subtrees before device-map inference."""
+    artifacts = _active_artifacts_api()
+    if artifacts is None:
+        return ()
+    return artifacts.claim_kt_routed_expert_subtrees(model)
+
+
 def mark_kt_int8_routed_expert_base_parameters(model: Any, plan: Any) -> tuple[str, ...]:
     return _artifacts_api().mark_kt_int8_routed_expert_base_parameters(model, plan)
 
@@ -64,6 +81,33 @@ def is_kt_int8_routed_expert_base_parameter(parameter: Any) -> bool:
     except ImportError:
         return False
     return artifacts.is_kt_int8_routed_expert_base_parameter(parameter)
+
+
+@contextlib.contextmanager
+def project_kt_routed_experts_out_of_device_map(model: Any):
+    artifacts = _active_artifacts_api()
+    if artifacts is None:
+        yield
+        return
+    with artifacts.project_kt_routed_experts_out_of_device_map(model):
+        yield
+
+
+def prepare_kt_non_expert_device_map(model: Any, device_map: Any):
+    artifacts = _active_artifacts_api()
+    if artifacts is None:
+        return device_map
+    return artifacts.prepare_kt_non_expert_device_map(model, device_map)
+
+
+@contextlib.contextmanager
+def hide_kt_routed_experts_from_dispatch(model: Any):
+    artifacts = _active_artifacts_api()
+    if artifacts is None:
+        yield
+        return
+    with artifacts.hide_kt_routed_experts_from_dispatch(model):
+        yield
 
 
 @contextlib.contextmanager

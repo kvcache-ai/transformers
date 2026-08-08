@@ -4159,6 +4159,13 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                     use_kernels=use_kernels,
                 )
 
+        from .integrations.kt import is_kt_expert_loading_enabled
+
+        if is_kt_expert_loading_enabled():
+            from .integrations.kt_artifacts import claim_kt_routed_expert_subtrees
+
+            claim_kt_routed_expert_subtrees(model)
+
         if kt_load_plan is not None:
             from .integrations.kt_artifacts import mark_kt_int8_routed_expert_base_parameters
 
@@ -4208,7 +4215,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # KT wrapping: if KT expert loading is enabled, wrap MoE layers with KT kernel
         # before eval() so the model is returned in KT-wrapped state.
-        from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
+        from .integrations.kt import _get_kt_config
 
         if is_kt_expert_loading_enabled():
             kt_config = _get_kt_config()
