@@ -17,8 +17,7 @@ import json
 import math
 import os
 import warnings
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
 from enum import Enum
 from functools import cached_property
@@ -1688,8 +1687,16 @@ class TrainingArguments:
         if kt_config is None and is_accelerate_available() and self.accelerator_config is not None:
             kt_config = getattr(self.accelerator_config, "kt_config", None)
 
-        if kt_config is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
+        from .integrations.kt import _is_kt_config_environment_owned, unset_kt_config
+
+        environment_requests_kt = strtobool(os.environ.get("ACCELERATE_USE_KT", "false"))
+        if kt_config is not None:
             self.update_kt_config(kt_config)
+        elif environment_requests_kt and not _is_kt_config_environment_owned():
+            self.update_kt_config(None)
+        else:
+            # A new ordinary arguments object supersedes Transformers' previous process-global KT mirror.
+            unset_kt_config()
 
     def update_kt_config(
         self,
@@ -1707,37 +1714,21 @@ class TrainingArguments:
                 f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'."
             )
 
-        if isinstance(config, str):
-            with open(config, encoding="utf-8") as config_file:
-                config = json.load(config_file)
-        if config is None:
-            normalized_config = {}
-        elif isinstance(config, Mapping):
-            normalized_config = dict(config)
-        elif is_dataclass(config) and type(config).__name__ == "KTConfig":
-            normalized_config = {field.name: getattr(config, field.name) for field in fields(config)}
-        else:
-            raise TypeError(f"`config` must be a mapping, KTConfig, JSON path, or None, got {type(config).__name__}.")
-
         if adapter_name_or_path is not None and not isinstance(adapter_name_or_path, (str, os.PathLike)):
             raise TypeError(
                 f"`adapter_name_or_path` must be a path or None, got {type(adapter_name_or_path).__name__}."
             )
         normalized_adapter_path = os.fspath(adapter_name_or_path) if adapter_name_or_path is not None else None
 
-        from .integrations.kt import HfTrainerKTConfig
+        from .integrations.kt import configure_kt
 
-        hf_kt_config = HfTrainerKTConfig(normalized_config)
+        hf_kt_config = configure_kt(config)
         # Commit all public views only after normalization and validation have succeeded.
         self.kt_config = hf_kt_config.config
         self.hf_kt_config = hf_kt_config
         self.kt_adapter_name_or_path = normalized_adapter_path
         if self.accelerator_config is not None:
             self.accelerator_config.kt_config = hf_kt_config.config
-        if hf_kt_config.enabled:
-            os.environ["ACCELERATE_USE_KT"] = "true"
-        else:
-            os.environ.pop("ACCELERATE_USE_KT", None)
         return self
 
     def _validate_args(self):

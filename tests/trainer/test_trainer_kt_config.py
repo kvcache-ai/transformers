@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import json
 import os
 import tempfile
 import unittest
@@ -22,7 +24,13 @@ from unittest.mock import patch
 import torch
 
 from transformers import TrainingArguments
-from transformers.integrations.kt import HfTrainerKTConfig, unset_kt_config
+from transformers.integrations.kt import (
+    HfTrainerKTConfig,
+    _get_kt_config,
+    configure_kt,
+    is_kt_expert_loading_enabled,
+    unset_kt_config,
+)
 from transformers.trainer import Trainer
 
 
@@ -51,6 +59,72 @@ class TrainingArgumentsKTConfigTest(unittest.TestCase):
         self.assertIs(args.kt_config, args.hf_kt_config.config)
         self.assertIs(args.kt_config, args.accelerator_config.kt_config)
         self.assertEqual(args.kt_adapter_name_or_path, "/tmp/adapter")
+
+    def test_configure_kt_copies_mapping_and_keeps_state_while_handle_is_alive(self):
+        source = {"kt_backend": "AMXBF16", "kt_activation_policy": {"cpu": "retain"}}
+
+        handle = configure_kt(source)
+        source["kt_backend"] = "changed"
+        source["kt_activation_policy"]["cpu"] = "recompute"
+
+        self.assertEqual(handle.kt_backend, "AMXBF16")
+        self.assertEqual(handle.kt_activation_policy, {"cpu": "retain"})
+        self.assertIs(_get_kt_config(), handle)
+        self.assertEqual(os.environ["ACCELERATE_USE_KT"], "true")
+
+        del handle
+        gc.collect()
+
+        self.assertIsNone(_get_kt_config())
+        self.assertNotIn("ACCELERATE_USE_KT", os.environ)
+
+    def test_configure_kt_accepts_json_path_and_typed_config(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", encoding="utf-8") as config_file:
+            json.dump({"kt_backend": "AMXBF16"}, config_file)
+            config_file.flush()
+            json_handle = configure_kt(config_file.name)
+
+        self.assertEqual(json_handle.kt_backend, "AMXBF16")
+
+        @dataclass
+        class KTConfig:
+            kt_backend: str = "auto"
+            kt_lora_rank: int = 8
+
+        typed_config = KTConfig()
+        typed_handle = configure_kt(typed_config)
+
+        self.assertEqual(typed_config, KTConfig())
+        self.assertEqual(typed_handle.config, {"kt_backend": "auto", "kt_lora_rank": 8})
+        self.assertIs(_get_kt_config(), typed_handle)
+
+    def test_ordinary_arguments_supersede_live_transformers_owned_kt_state(self):
+        kt_args = TrainingArguments(
+            output_dir=tempfile.mkdtemp(),
+            kt_config={"kt_backend": "AMXBF16"},
+        )
+        kt_handle = kt_args.hf_kt_config
+        kt_mapping = kt_args.kt_config
+        self.assertEqual(os.environ["ACCELERATE_USE_KT"], "true")
+
+        ordinary_args = TrainingArguments(output_dir=tempfile.mkdtemp())
+
+        self.assertIs(kt_args.hf_kt_config, kt_handle)
+        self.assertIs(kt_args.kt_config, kt_mapping)
+        self.assertFalse(hasattr(ordinary_args, "hf_kt_config"))
+        self.assertIsNone(ordinary_args.kt_config)
+        self.assertIsNone(_get_kt_config())
+        self.assertFalse(is_kt_expert_loading_enabled())
+        self.assertNotIn("ACCELERATE_USE_KT", os.environ)
+
+    def test_external_environment_still_enables_ordinary_arguments(self):
+        with patch.dict(os.environ, {"ACCELERATE_USE_KT": "true"}):
+            args = TrainingArguments(output_dir=tempfile.mkdtemp())
+
+            self.assertTrue(args.hf_kt_config.enabled)
+            self.assertIs(_get_kt_config(), args.hf_kt_config)
+            unset_kt_config()
+            self.assertEqual(os.environ["ACCELERATE_USE_KT"], "true")
 
     def test_post_init_keeps_raw_mapping_for_a_second_public_update(self):
         raw_config = {"kt_num_threads": 32}

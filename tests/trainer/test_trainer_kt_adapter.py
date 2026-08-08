@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import tempfile
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from transformers.trainer import Trainer, _load_fresh_kt_adapter
+from transformers.trainer import Trainer
+from transformers.trainer_utils import HubStrategy, SaveStrategy
 
 
 class _StagedAccelerator:
@@ -73,21 +75,6 @@ class TrainerKTAdapterTest(unittest.TestCase):
             excluded_parameter_names=trainer._kt_placeholder_names,
         )
         trainer._save.assert_called_once_with("/tmp/kt-adapter", state_dict=adapter_state)
-
-    def test_fresh_adapter_uses_explicit_public_path(self):
-        model = object()
-        with patch("transformers.integrations.kt_artifacts.load_kt_adapter_artifacts") as load_adapter:
-            loaded_path = _load_fresh_kt_adapter(model, Path("/tmp/adapter"))
-
-        self.assertEqual(loaded_path, "/tmp/adapter")
-        load_adapter.assert_called_once_with(model, "/tmp/adapter")
-
-    def test_missing_fresh_adapter_path_is_a_noop(self):
-        with patch("transformers.integrations.kt_artifacts.load_kt_adapter_artifacts") as load_adapter:
-            loaded_path = _load_fresh_kt_adapter(object(), None)
-
-        self.assertIsNone(loaded_path)
-        load_adapter.assert_not_called()
 
     def test_staged_lifecycle_adapts_before_optimizer_and_scheduler(self):
         events = []
@@ -268,6 +255,33 @@ class TrainerKTAdapterTest(unittest.TestCase):
             "resumed adapter load",
         )
 
+    def test_load_best_model_restores_standard_then_fused_adapter(self):
+        events = []
+        model = torch.nn.Linear(2, 2)
+        model.active_adapters = ["default"]
+        model.load_adapter = Mock(side_effect=lambda *_args: events.append("standard"))
+        trainer = object.__new__(Trainer)
+        trainer.model = trainer.model_wrapped = model
+        trainer.is_deepspeed_enabled = False
+        trainer.is_fsdp_enabled = False
+        trainer.is_kt_enabled = True
+        trainer.state = SimpleNamespace(best_model_checkpoint=None, best_metric=0.5)
+        trainer.accelerator = SimpleNamespace(unwrap_model=Mock(return_value=model))
+        trainer._issue_warnings_after_load = Mock()
+        trainer._load_kt_adapter_collectively = Mock(side_effect=lambda *_args: events.append("fused"))
+
+        with tempfile.TemporaryDirectory() as checkpoint:
+            trainer.state.best_model_checkpoint = checkpoint
+            open(os.path.join(checkpoint, "adapter_model.safetensors"), "wb").close()
+            with (
+                patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
+                patch("transformers.trainer._is_peft_model", return_value=True),
+            ):
+                trainer._load_best_model()
+
+        self.assertEqual(events, ["standard", "fused"])
+        trainer._load_kt_adapter_collectively.assert_called_once_with(model, checkpoint, "best adapter load")
+
     def test_collective_adapter_load_reports_local_failure_before_barrier(self):
         trainer = object.__new__(Trainer)
         trainer._raise_if_kt_checkpoint_failed = Mock()
@@ -298,6 +312,80 @@ class TrainerKTAdapterTest(unittest.TestCase):
 
         self.assertTrue(any(parameter is kt_parameter for parameter in optimizer.param_groups[0]["params"]))
         self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.1)
+
+    def test_create_optimizer_rejects_special_parameter_owners_with_external_kt_weights(self):
+        for owner in ("params", "model", "optimizer_dict", "factory"):
+            with self.subTest(owner=owner):
+                model = torch.nn.Linear(2, 2)
+                kt_parameter = torch.nn.Parameter(torch.ones(2, 2))
+                trainer = object.__new__(Trainer)
+                trainer.model = model
+                trainer.optimizer = None
+                optimizer_kwargs = {"lr": 1e-3}
+                if owner != "factory":
+                    optimizer_kwargs[owner] = object()
+                trainer.optimizer_cls_and_kwargs = (torch.optim.AdamW, optimizer_kwargs)
+                trainer.args = SimpleNamespace(weight_decay=0.1)
+                trainer._kt_optimizer_named_parameters = (
+                    ("kt.layers.0.experts.fused_lora.gate_lora_a", kt_parameter),
+                )
+                trainer.get_decay_parameter_names = lambda _model: ["weight"]
+
+                with (
+                    patch("transformers.trainer.is_optimizer_factory", return_value=owner == "factory"),
+                    self.assertRaisesRegex(ValueError, "KT-managed parameters outside the model tree"),
+                ):
+                    trainer.create_optimizer()
+
+    def test_push_from_checkpoint_republishes_complete_kt_bundle_at_output_root(self):
+        trainer = object.__new__(Trainer)
+        trainer.is_kt_enabled = True
+        trainer.is_world_process_zero = lambda: True
+        trainer.model = torch.nn.Linear(2, 2)
+        kt_model = object()
+        trainer.accelerator = SimpleNamespace(unwrap_model=Mock(return_value=kt_model))
+        trainer.callback_handler = SimpleNamespace(on_push_begin=Mock())
+        trainer.control = object()
+        trainer.state = SimpleNamespace(global_step=7, epoch=1.0)
+        trainer.processing_class = None
+        trainer.push_in_progress = None
+        trainer.hub_model_id = "organization/model"
+
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = os.path.join(root, "checkpoint-7")
+            output_dir = os.path.join(root, "output")
+            os.makedirs(checkpoint)
+            os.makedirs(output_dir)
+            for filename in ("adapter_config.json", "adapter_model.safetensors"):
+                open(os.path.join(checkpoint, filename), "wb").close()
+            trainer.args = SimpleNamespace(
+                output_dir=output_dir,
+                hub_strategy=HubStrategy.EVERY_SAVE,
+                hub_always_push=False,
+                save_strategy=SaveStrategy.STEPS,
+                hub_token=None,
+                hub_revision=None,
+            )
+
+            def save_bundle(_model, destination):
+                open(os.path.join(destination, "kt_adapter_manifest.json"), "wb").close()
+                open(os.path.join(destination, "kt_fused_lora.safetensors"), "wb").close()
+
+            with (
+                patch("transformers.trainer.is_peft_available", return_value=True),
+                patch(
+                    "transformers.integrations.kt_artifacts.save_kt_adapter_artifacts",
+                    side_effect=save_bundle,
+                ) as save_kt,
+                patch("transformers.trainer.upload_folder", return_value=Mock()) as upload,
+            ):
+                trainer._push_from_checkpoint(checkpoint)
+
+            self.assertTrue(os.path.isfile(os.path.join(output_dir, "adapter_model.safetensors")))
+            self.assertTrue(os.path.isfile(os.path.join(output_dir, "kt_adapter_manifest.json")))
+            self.assertTrue(os.path.isfile(os.path.join(output_dir, "kt_fused_lora.safetensors")))
+            save_kt.assert_called_once_with(kt_model, output_dir)
+            upload.assert_called_once()
 
 
 if __name__ == "__main__":

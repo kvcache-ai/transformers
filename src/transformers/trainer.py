@@ -295,21 +295,6 @@ def _atomic_path_save(save_function: Callable[[str], None], destination: str) ->
         raise
 
 
-def _load_fresh_kt_adapter(
-    model: nn.Module,
-    adapter_name_or_path: str | os.PathLike | None,
-) -> str | None:
-    """Restore KT-owned tensors from the public fresh-adapter path after LoRA adaptation."""
-    if adapter_name_or_path is None:
-        return None
-    adapter_path = os.fspath(adapter_name_or_path)
-    from .integrations.kt_artifacts import load_kt_adapter_artifacts
-
-    load_kt_adapter_artifacts(model, adapter_path)
-    logger.info(f"Loaded KT-owned adapter tensors from {adapter_path}")
-    return adapter_path
-
-
 def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
     """Atomically save a torch state dict."""
     _atomic_path_save(partial(torch.save, state_dict), destination)
@@ -1321,19 +1306,15 @@ class Trainer:
             decay_parameters = set(self.get_decay_parameter_names(opt_model))
             trainable_named_parameters = [(n, p) for n, p in opt_model.named_parameters() if p.requires_grad]
             registered_parameter_ids = {id(parameter) for _, parameter in trainable_named_parameters}
+            external_kt_parameter_names = []
             for name, parameter in getattr(self, "_kt_optimizer_named_parameters", ()):
                 if id(parameter) in registered_parameter_ids:
                     continue
                 trainable_named_parameters.append((name, parameter))
                 registered_parameter_ids.add(id(parameter))
+                external_kt_parameter_names.append(name)
                 # KT-owned optimizer tensors are matrix weights; apply the same decay policy as linear weights.
                 decay_parameters.add(name)
-            if os.environ.get("USE_KT") == "1":
-                print(
-                    f"[kt_smoke] trainer.create_optimizer: decay_names={len(decay_parameters)} "
-                    f"trainable_named_parameters={len(trainable_named_parameters)}",
-                    flush=True,
-                )
             optimizer_grouped_parameters = [
                 {
                     "params": [p for n, p in trainable_named_parameters if n in decay_parameters],
@@ -1349,6 +1330,21 @@ class Trainer:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
             else:
                 optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+            unsupported_parameter_owner = next(
+                (name for name in ("params", "model", "optimizer_dict") if name in optimizer_kwargs),
+                None,
+            )
+            if external_kt_parameter_names and (
+                is_optimizer_factory(optimizer_cls) or unsupported_parameter_owner is not None
+            ):
+                owner = "optimizer factory" if unsupported_parameter_owner is None else unsupported_parameter_owner
+                raise ValueError(
+                    f"The selected optimizer uses {owner!r} to own its parameters and cannot safely include "
+                    "KT-managed parameters outside the model tree. Use a standard Trainer optimizer or provide a "
+                    "fully constructed optimizer containing every KT parameter. Missing external parameters: "
+                    f"{external_kt_parameter_names}."
+                )
 
             # Check if this is a factory (for complex optimizers like Muon, Dion)
             # Factories are instantiated first, then called with (opt_model, **kwargs)
@@ -1671,7 +1667,7 @@ class Trainer:
         self._globalstep_last_logged = self.state.global_step
 
         if self.is_kt_enabled:
-            # Keep KT LoRA grad views alive (avoid set_to_none=True clearing them).
+            # KT releases authoritative grads before zeroing.
             self.optimizer.zero_grad(set_to_none=False)
         else:
             model.zero_grad()
@@ -2080,7 +2076,7 @@ class Trainer:
                             self.lr_scheduler.step()
 
                     if self.is_kt_enabled:
-                        # Use optimizer.zero_grad() with set_to_none=False to keep KT LoRA grad views alive.
+                        # KT releases authoritative grads before zeroing.
                         self.optimizer.zero_grad(set_to_none=False)
                     else:
                         model.zero_grad()
@@ -3992,6 +3988,14 @@ class Trainer:
                 "on multiple nodes, you should activate `--save_on_each_node`."
             )
 
+        if self.is_kt_enabled:
+            kt_model = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+            self._load_kt_adapter_collectively(
+                kt_model,
+                self.state.best_model_checkpoint,
+                "best adapter load",
+            )
+
     def _load_rng_state(self, checkpoint: str | None) -> None:
         """Restore random number generator states from a checkpoint."""
         # Load RNG states from `checkpoint`
@@ -4622,6 +4626,11 @@ class Trainer:
         for modeling_file in modeling_files:
             if os.path.isfile(os.path.join(checkpoint_folder, modeling_file)):
                 shutil.copy(os.path.join(checkpoint_folder, modeling_file), os.path.join(output_dir, modeling_file))
+        if self.is_kt_enabled:
+            from .integrations.kt_artifacts import save_kt_adapter_artifacts
+
+            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+            save_kt_adapter_artifacts(kt_model, output_dir)
         # Saving the processing class is fast and we don't know how many files it may have spawned, so we resave it to be sure.
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)

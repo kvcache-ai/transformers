@@ -4387,15 +4387,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         """Perform all post processing operations after having loaded some checkpoints into a model, such as moving
         missing keys from meta device to their expected device, reinitializing missing weights according to proper
         distributions, tying the weights and logging the loading report."""
-        # KT: filter expert keys from missing_keys and replace meta params with CPU placeholders.
-        from .integrations.kt import is_kt_expert_loading_enabled
+        # KT owns routed-expert names; Transformers only preserves skipped tensors until wrapper replacement.
+        from .integrations.kt import is_kt_expert_loading_enabled, is_kt_routed_expert_parameter_name
 
         if is_kt_expert_loading_enabled():
-            _kt_re_legacy = re.compile(r"\.experts\.\d+\.")
-            _kt_re_fused = re.compile(r"\.experts\.(gate_up_proj|down_proj|gate_proj|up_proj)$")
-            expert_missing = {
-                k for k in loading_info.missing_keys if _kt_re_legacy.search(k) or _kt_re_fused.search(k)
-            }
+            expert_missing = {k for k in loading_info.missing_keys if is_kt_routed_expert_parameter_name(k)}
             if expert_missing:
                 loading_info.missing_keys -= expert_missing
                 for key in expert_missing:
@@ -4417,7 +4413,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                             stride=[0] * len(param.shape),
                         )
                         placeholder = nn.Parameter(fake_tensor, requires_grad=False)
-                        placeholder._kt_zero_storage_placeholder = True
                         setattr(module, param_name, placeholder)
                     module._is_hf_initialized = True
 
@@ -4663,14 +4658,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # In this case we need to move everything back
         if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
-            from .integrations.kt import is_kt_expert_loading_enabled
+            from .integrations.kt import is_kt_expert_loading_enabled, is_kt_routed_expert_parameter_name
 
-            _kt_skip_zeros = is_kt_expert_loading_enabled()
-            _kt_expert_re = (
-                re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)") if _kt_skip_zeros else None
-            )
+            skip_kt_routed_experts = is_kt_expert_loading_enabled()
             for key, param in self.named_parameters():
-                if _kt_expert_re is not None and _kt_expert_re.search(key):
+                if skip_kt_routed_experts and is_kt_routed_expert_parameter_name(key):
                     continue
                 value = torch.zeros_like(param, device="cpu")
                 _load_parameter_into_model(self, key, value)

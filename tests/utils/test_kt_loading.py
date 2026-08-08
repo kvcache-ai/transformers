@@ -26,7 +26,7 @@ from transformers.integrations.kt import (
     is_kt_prequantized_expert_loading_enabled,
     unset_kt_config,
 )
-from transformers.modeling_utils import get_total_byte_count
+from transformers.modeling_utils import PreTrainedModel, get_total_byte_count
 from transformers.utils.loading_report import LoadStateDictInfo
 
 
@@ -185,6 +185,34 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
                 warmup_bytes = get_total_byte_count(model, device_map)
 
                 self.assertEqual(warmup_bytes["cuda:0"], 16)
+
+    def test_fsdp_rank_zero_fill_delegates_routed_expert_names_to_kt(self):
+        expert_name = "model.layers.3.mlp.experts.new_layout.weight"
+        normal_name = "model.norm.weight"
+        model = SimpleNamespace(
+            named_parameters=lambda: [
+                (expert_name, torch.empty(2, 2, device="meta")),
+                (normal_name, torch.empty(2, device="meta")),
+            ],
+            named_buffers=lambda: [],
+        )
+
+        with (
+            patch("transformers.modeling_utils.is_deepspeed_zero3_enabled", return_value=False),
+            patch("transformers.modeling_utils.is_fsdp_enabled", return_value=True),
+            patch("transformers.modeling_utils.is_local_dist_rank_0", return_value=False),
+            patch("transformers.integrations.kt.is_kt_expert_loading_enabled", return_value=True),
+            patch(
+                "transformers.integrations.kt.is_kt_routed_expert_parameter_name",
+                side_effect=lambda name: name == expert_name,
+            ) as is_routed,
+            patch("transformers.modeling_utils._load_parameter_into_model") as load_parameter,
+        ):
+            PreTrainedModel._move_missing_keys_from_meta_to_device(model, set(), None, None, None)
+
+        self.assertEqual([call.args[0] for call in is_routed.call_args_list], [expert_name, normal_name])
+        load_parameter.assert_called_once()
+        self.assertEqual(load_parameter.call_args.args[:2], (model, normal_name))
 
 
 if __name__ == "__main__":

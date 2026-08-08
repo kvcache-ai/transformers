@@ -13,13 +13,27 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 import weakref
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from typing import Any
 
 
 _kt_config_weak_ref: weakref.ReferenceType | None = None
+_kt_environment_owner_ref: weakref.ReferenceType | None = None
+
+
+def _clear_collected_kt_state(reference: weakref.ReferenceType) -> None:
+    """Release only process-global state owned by the collected KT config."""
+    global _kt_config_weak_ref, _kt_environment_owner_ref
+
+    if _kt_config_weak_ref is reference:
+        _kt_config_weak_ref = None
+    if _kt_environment_owner_ref is reference:
+        _kt_environment_owner_ref = None
+        os.environ.pop("ACCELERATE_USE_KT", None)
 
 
 class HfTrainerKTConfig:
@@ -110,14 +124,58 @@ class HfTrainerKTConfig:
         return bool(self.enabled)
 
 
+def _normalize_kt_config(config: Any) -> Any:
+    """Normalize public KT inputs without mutating the caller's object."""
+    if isinstance(config, str):
+        with open(config, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    if config is None:
+        return {}
+    if isinstance(config, Mapping):
+        return dict(config)
+    if is_dataclass(config) and type(config).__name__ == "KTConfig":
+        return {field.name: getattr(config, field.name) for field in fields(config)}
+    raise TypeError(f"`config` must be a mapping, KTConfig, JSON path, or None, got {type(config).__name__}.")
+
+
+def configure_kt(config: Any) -> HfTrainerKTConfig:
+    """Configure KT for model loading; retain the returned handle until loading finishes."""
+    kt_config = HfTrainerKTConfig(_normalize_kt_config(config))
+    _set_kt_config_environment(kt_config, kt_config.enabled)
+    return kt_config
+
+
 def set_kt_config(kt_config: Any) -> None:
     global _kt_config_weak_ref
-    _kt_config_weak_ref = weakref.ref(kt_config)
+    _kt_config_weak_ref = weakref.ref(kt_config, _clear_collected_kt_state)
+
+
+def _set_kt_config_environment(kt_config: Any, enabled: bool) -> None:
+    """Mirror explicit KT activation to Accelerate without leaking it past its owner."""
+    global _kt_environment_owner_ref
+
+    if not enabled:
+        _kt_environment_owner_ref = None
+        os.environ.pop("ACCELERATE_USE_KT", None)
+        return
+
+    environment_was_enabled = os.environ.get("ACCELERATE_USE_KT", "").lower() in ("1", "true", "yes")
+    environment_was_owned = _kt_environment_owner_ref is not None
+    os.environ["ACCELERATE_USE_KT"] = "true"
+    if not environment_was_enabled or environment_was_owned:
+        _kt_environment_owner_ref = weakref.ref(kt_config, _clear_collected_kt_state)
+
+
+def _is_kt_config_environment_owned() -> bool:
+    return _kt_environment_owner_ref is not None and _kt_environment_owner_ref() is not None
 
 
 def unset_kt_config() -> None:
-    global _kt_config_weak_ref
+    global _kt_config_weak_ref, _kt_environment_owner_ref
     _kt_config_weak_ref = None
+    if _kt_environment_owner_ref is not None:
+        _kt_environment_owner_ref = None
+        os.environ.pop("ACCELERATE_USE_KT", None)
 
 
 def _get_kt_config() -> Any | None:

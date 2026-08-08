@@ -118,6 +118,7 @@ _import_structure = {
         "run_hp_search_ray",
         "run_hp_search_wandb",
     ],
+    "kt": ["configure_kt"],
     "liger": ["apply_liger_kernel"],
     "metal_quantization": [
         "MetalLinear",
@@ -272,6 +273,7 @@ if TYPE_CHECKING:
         run_hp_search_ray,
         run_hp_search_wandb,
     )
+    from .kt import configure_kt
     from .liger import apply_liger_kernel
     from .metal_quantization import (
         MetalLinear,
