@@ -117,19 +117,6 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
             )
         )
 
-    def test_int8_environment_configuration_is_strict(self):
-        with patch.dict(
-            "os.environ",
-            {
-                "ACCELERATE_USE_KT": "true",
-                "ACCELERATE_KT_SKIP_EXPERT_LOADING": "true",
-                "ACCELERATE_KT_EXPERT_WEIGHT_FORMAT": "int8",
-            },
-            clear=False,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "missing_keys"):
-                _validate_kt_int8_loading_info(_loading_info(missing_keys={"model.layers.3.self_attn.q_proj.weight"}))
-
     def test_fp8_uses_the_same_strict_non_expert_contract(self):
         self.kt_config = HfTrainerKTConfig(
             {
@@ -149,7 +136,7 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
                 _loading_info(missing_keys={"model.layers.3.self_attn.q_proj.weight"})
             )
 
-    def test_fp8_lora_dropout_is_loaded_from_environment(self):
+    def test_wrapper_does_not_import_kernel_fields_from_environment(self):
         with patch.dict(
             "os.environ",
             {
@@ -161,7 +148,8 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
         ):
             self.kt_config = HfTrainerKTConfig({"enabled": True})
 
-        self.assertAlmostEqual(self.kt_config.kt_lora_dropout, 0.125)
+        with self.assertRaises(AttributeError):
+            _ = self.kt_config.kt_lora_dropout
 
     def test_fp8_routed_experts_are_excluded_from_allocator_warmup(self):
         self.kt_config = HfTrainerKTConfig(

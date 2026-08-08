@@ -17,7 +17,8 @@ import json
 import math
 import os
 import warnings
-from dataclasses import asdict, dataclass, field, fields
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import timedelta
 from enum import Enum
 from functools import cached_property
@@ -1422,6 +1423,11 @@ class TrainingArguments:
             )
         },
     )
+    kt_adapter_name_or_path: str | None = field(
+        default=None,
+        init=False,
+        metadata={"help": "Optional adapter directory containing KT-owned fused expert LoRA tensors."},
+    )
 
     # --- Debugging ---
     debug: str | list[DebugOption] = field(
@@ -1677,39 +1683,62 @@ class TrainingArguments:
             self.deepspeed_plugin.set_deepspeed_weakref()
 
         # ── 13. KTransformers ──
-        # Priority: self.kt_config > accelerator_config.kt_config > ACCELERATE_USE_KT env var
-        kt_config_dict = None
-        if self.kt_config is not None:
-            if isinstance(self.kt_config, str):
-                import json
+        # Priority: self.kt_config > accelerator_config.kt_config > ACCELERATE_USE_KT env var.
+        kt_config = self.kt_config
+        if kt_config is None and is_accelerate_available() and self.accelerator_config is not None:
+            kt_config = getattr(self.accelerator_config, "kt_config", None)
 
-                with open(self.kt_config, "r") as f:
-                    kt_config_dict = json.load(f)
-            else:
-                kt_config_dict = self.kt_config
+        if kt_config is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
+            self.update_kt_config(kt_config)
 
-        if kt_config_dict is None and is_accelerate_available() and self.accelerator_config is not None:
-            kt_config_dict = getattr(self.accelerator_config, "kt_config", None)
+    def update_kt_config(
+        self,
+        config: Any,
+        *,
+        adapter_name_or_path: str | os.PathLike | None = None,
+    ):
+        """Atomically configure KTransformers for model loading and training.
 
-        if isinstance(kt_config_dict, dict):
-            kt_config_dict.setdefault("enabled", True)
-            kt_config_dict.setdefault("kt_skip_expert_loading", True)
+        The input mapping is never mutated. The normalized copy is shared by `kt_config`, `hf_kt_config`, and
+        `AcceleratorConfig`, so callers do not need to write Transformers private attributes.
+        """
+        if not is_accelerate_available():
+            raise ValueError(
+                f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'."
+            )
 
-        if kt_config_dict is not None or strtobool(os.environ.get("ACCELERATE_USE_KT", "false")):
-            if not is_accelerate_available():
-                raise ValueError(
-                    f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'`."
-                )
-            from .integrations.kt import HfTrainerKTConfig
+        if isinstance(config, str):
+            with open(config, encoding="utf-8") as config_file:
+                config = json.load(config_file)
+        if config is None:
+            normalized_config = {}
+        elif isinstance(config, Mapping):
+            normalized_config = dict(config)
+        elif is_dataclass(config) and type(config).__name__ == "KTConfig":
+            normalized_config = {field.name: getattr(config, field.name) for field in fields(config)}
+        else:
+            raise TypeError(f"`config` must be a mapping, KTConfig, JSON path, or None, got {type(config).__name__}.")
 
-            # Keep a strong reference on `TrainingArguments` so the weakref stays alive.
-            self.hf_kt_config = HfTrainerKTConfig(kt_config_dict)
-            self.hf_kt_config.trainer_config_process(self)
-            if getattr(self.hf_kt_config, "enabled", False):
-                os.environ["ACCELERATE_USE_KT"] = "true"
+        if adapter_name_or_path is not None and not isinstance(adapter_name_or_path, (str, os.PathLike)):
+            raise TypeError(
+                f"`adapter_name_or_path` must be a path or None, got {type(adapter_name_or_path).__name__}."
+            )
+        normalized_adapter_path = os.fspath(adapter_name_or_path) if adapter_name_or_path is not None else None
 
-            if self.accelerator_config is not None and kt_config_dict is not None:
-                self.accelerator_config.kt_config = kt_config_dict
+        from .integrations.kt import HfTrainerKTConfig
+
+        hf_kt_config = HfTrainerKTConfig(normalized_config)
+        # Commit all public views only after normalization and validation have succeeded.
+        self.kt_config = hf_kt_config.config
+        self.hf_kt_config = hf_kt_config
+        self.kt_adapter_name_or_path = normalized_adapter_path
+        if self.accelerator_config is not None:
+            self.accelerator_config.kt_config = hf_kt_config.config
+        if hf_kt_config.enabled:
+            os.environ["ACCELERATE_USE_KT"] = "true"
+        else:
+            os.environ.pop("ACCELERATE_USE_KT", None)
+        return self
 
     def _validate_args(self):
         """Validate argument combinations and value constraints."""

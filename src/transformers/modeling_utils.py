@@ -4041,19 +4041,23 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
 
-        from .integrations.kt_artifacts import prepare_kt_non_expert_cache
+        from .integrations.kt_artifacts import resolve_kt_pretrained_artifacts
 
-        kt_non_expert_cache = None
+        kt_load_plan = None
         if pretrained_model_name_or_path is not None:
-            kt_non_expert_cache = prepare_kt_non_expert_cache(
-                config,
+            kt_load_plan = resolve_kt_pretrained_artifacts(
                 pretrained_model_name_or_path,
                 quantization_config,
             )
-        elif os.environ.get("ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH"):
-            raise RuntimeError("KT non-expert cache loading requires `pretrained_model_name_or_path` for provenance.")
-        if kt_non_expert_cache is not None and (state_dict is not None or gguf_file is not None):
+        if kt_load_plan is not None and (state_dict is not None or gguf_file is not None):
             raise RuntimeError("KT non-expert cache loading cannot be combined with `state_dict` or `gguf_file`.")
+        if (
+            kt_load_plan is not None
+            and kt_load_plan.disable_source_quantizer
+            and hasattr(config, "quantization_config")
+        ):
+            # The plan points at validated non-expert weights in their target dtype, not the source model's quantizer.
+            delattr(config, "quantization_config")
 
         hf_quantizer, config, device_map = get_hf_quantizer(
             config, quantization_config, device_map, weights_only, user_agent
@@ -4078,7 +4082,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             )
             use_kernels = True
 
-        if kt_non_expert_cache is None:
+        if kt_load_plan is None:
             checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(
                 pretrained_model_name_or_path=pretrained_model_name_or_path,
                 variant=variant,
@@ -4094,7 +4098,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             if variant is not None or use_safetensors is False:
                 raise RuntimeError("KT non-expert cache requires the default safetensors variant.")
             checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(
-                pretrained_model_name_or_path=kt_non_expert_cache.path,
+                pretrained_model_name_or_path=kt_load_plan.weight_path,
                 variant=None,
                 gguf_file=None,
                 use_safetensors=True,
@@ -4103,7 +4107,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 is_remote_code=False,
                 tqdm_class=tqdm_class,
             )
-            if set(checkpoint_files or ()) != set(kt_non_expert_cache.checkpoint_files):
+            if set(checkpoint_files or ()) != set(kt_load_plan.checkpoint_files):
                 raise RuntimeError(
                     "Resolved KT non-expert checkpoint shards do not match the validated cache manifest."
                 )
@@ -4155,10 +4159,10 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                     use_kernels=use_kernels,
                 )
 
-        if kt_non_expert_cache is not None:
+        if kt_load_plan is not None:
             from .integrations.kt_artifacts import mark_kt_int8_routed_expert_base_parameters
 
-            mark_kt_int8_routed_expert_base_parameters(model, kt_non_expert_cache)
+            mark_kt_int8_routed_expert_base_parameters(model, kt_load_plan)
 
         # Create the dtype_plan to potentially use the `keep_in_fp32` flags (this needs to be called on the already
         # instantiated model, as the flags can be modified by instances sometimes)
@@ -4193,22 +4197,30 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         )
         loading_info, disk_offload_index = cls._load_pretrained_model(model, state_dict, checkpoint_files, load_config)
         loading_info = cls._finalize_model_loading(model, load_config, loading_info)
+        if kt_load_plan is not None:
+            from .integrations.kt_artifacts import validate_kt_pretrained_load
+
+            validate_kt_pretrained_load(kt_load_plan, loading_info, model)
+        else:
+            from .integrations.kt import _validate_kt_prequantized_loading_info
+
+            _validate_kt_prequantized_loading_info(loading_info, model)
 
         # KT wrapping: if KT expert loading is enabled, wrap MoE layers with KT kernel
         # before eval() so the model is returned in KT-wrapped state.
         from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
 
         if is_kt_expert_loading_enabled():
-            from .integrations.kt_artifacts import attach_kt_artifact_provenance
-
-            attach_kt_artifact_provenance(model, pretrained_model_name_or_path, kt_non_expert_cache)
             kt_config = _get_kt_config()
             if kt_config is not None:
-                if hasattr(kt_config, "_kt_config") and isinstance(kt_config._kt_config, dict):
-                    if checkpoint_files is not None:
-                        kt_config._kt_config.setdefault("kt_checkpoint_files", checkpoint_files)
-                    if sharded_metadata is not None:
-                        kt_config._kt_config.setdefault("kt_sharded_metadata", sharded_metadata)
+                set_runtime_metadata = getattr(kt_config, "set_runtime_metadata", None)
+                if set_runtime_metadata is not None:
+                    set_runtime_metadata(
+                        kt_checkpoint_files=checkpoint_files,
+                        kt_sharded_metadata=sharded_metadata,
+                        kt_pretrained_load_plan=kt_load_plan,
+                        kt_source_model_name_or_path=pretrained_model_name_or_path,
+                    )
 
                 from kt_kernel.sft import wrap_moe_layers_with_kt_wrapper
 
@@ -4336,18 +4348,23 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
             # KT: stash checkpoint_files on kt_config so from_pretrained's KT wrapper can access them,
             # and filter expert keys from the state dict — KT kernel loads them directly.
-            from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
+            from .integrations.kt import (
+                _get_kt_config,
+                is_kt_expert_loading_enabled,
+                is_kt_routed_expert_parameter_name,
+            )
 
             if is_kt_expert_loading_enabled():
                 kt_config = _get_kt_config()
-                if (
-                    kt_config is not None
-                    and hasattr(kt_config, "_kt_config")
-                    and isinstance(kt_config._kt_config, dict)
-                ):
-                    kt_config._kt_config.setdefault("kt_checkpoint_files", checkpoint_files)
-                _kt_re = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)")
-                merged_state_dict = {k: v for k, v in merged_state_dict.items() if not _kt_re.search(k)}
+                if kt_config is not None:
+                    set_runtime_metadata = getattr(kt_config, "set_runtime_metadata", None)
+                    if set_runtime_metadata is not None:
+                        set_runtime_metadata(kt_checkpoint_files=checkpoint_files)
+                merged_state_dict = {
+                    key: value
+                    for key, value in merged_state_dict.items()
+                    if not is_kt_routed_expert_parameter_name(key)
+                }
 
             loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
                 model=model,
@@ -4434,9 +4451,6 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 logger=logger,
             )
 
-        from .integrations.kt import _validate_kt_prequantized_loading_info
-
-        _validate_kt_prequantized_loading_info(loading_info, model)
         return loading_info
 
     def retrieve_modules_from_names(self, names, add_prefix=False, remove_prefix=False):

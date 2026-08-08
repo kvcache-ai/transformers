@@ -241,16 +241,17 @@ if is_accelerate_available():
 
     try:
         from kt_kernel.sft import (
-            get_kt_lora_params,
+            get_kt_named_trainable_params,
             kt_adapt_peft_lora,
-            load_kt_moe_from_adapter,
-            save_kt_moe_to_adapter,
             update_kt_lora_pointers,
         )
     except ImportError:
-        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = (
-            update_kt_lora_pointers
-        ) = None
+        get_kt_named_trainable_params = kt_adapt_peft_lora = update_kt_lora_pointers = None
+
+    try:
+        from kt_kernel.sft import get_kt_rank_local_parameter_names
+    except ImportError:
+        get_kt_rank_local_parameter_names = None
 
 
 if TYPE_CHECKING:
@@ -294,69 +295,19 @@ def _atomic_path_save(save_function: Callable[[str], None], destination: str) ->
         raise
 
 
-def _load_fresh_kt_adapter(model: nn.Module, resume_from_checkpoint: str | None) -> str | None:
-    """Restore KT-owned adapter tensors after the post-FSDP LoRA adaptation step."""
-    if (
-        resume_from_checkpoint is not None
-        or load_kt_moe_from_adapter is None
-        or getattr(model, "_kt_adapter_loaded", False)
-    ):
+def _load_fresh_kt_adapter(
+    model: nn.Module,
+    adapter_name_or_path: str | os.PathLike | None,
+) -> str | None:
+    """Restore KT-owned tensors from the public fresh-adapter path after LoRA adaptation."""
+    if adapter_name_or_path is None:
         return None
-
-    adapter_path = getattr(model, "_kt_adapter_path", None)
-    if adapter_path is None:
-        return None
-    if not isinstance(adapter_path, (str, os.PathLike)):
-        raise TypeError(f"`_kt_adapter_path` must be a path, got {type(adapter_path).__name__}.")
-
-    adapter_path = os.fspath(adapter_path)
+    adapter_path = os.fspath(adapter_name_or_path)
     from .integrations.kt_artifacts import load_kt_adapter_artifacts
 
-    load_kt_adapter_artifacts(model, adapter_path, load_kt_moe_from_adapter)
-    model._kt_adapter_loaded = True
+    load_kt_adapter_artifacts(model, adapter_path)
     logger.info(f"Loaded KT-owned adapter tensors from {adapter_path}")
     return adapter_path
-
-
-def _get_kt_fsdp2_peft_state_dict(model: nn.Module) -> dict[str, Any]:
-    """Gather only trainable PEFT state for a KT FSDP2 adapter save."""
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
-    def is_kt_placeholder(name: str, parameter: nn.Parameter) -> bool:
-        if name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")):
-            return True
-        if getattr(parameter, "_kt_zero_storage_placeholder", False):
-            return True
-        if parameter.device.type != "cpu" or parameter.numel() == 0 or any(parameter.stride()):
-            return False
-        try:
-            return parameter.untyped_storage().nbytes() < parameter.numel() * parameter.element_size()
-        except (NotImplementedError, RuntimeError):
-            return False
-
-    placeholders = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if not parameter.requires_grad and is_kt_placeholder(name, parameter)
-    ]
-    logger.info(f"Excluding {len(placeholders)} zero-storage KT placeholders from DCP frozen-parameter filtering")
-    try:
-        # DCP assumes every frozen parameter is present in model.state_dict().
-        # KT placeholders are intentionally omitted, so keep them out of DCP's
-        # frozen-parameter filtering while it gathers the actual PEFT tensors.
-        for parameter in placeholders:
-            parameter.requires_grad_(True)
-        return get_model_state_dict(
-            model,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-                ignore_frozen_params=True,
-            ),
-        )
-    finally:
-        for parameter in placeholders:
-            parameter.requires_grad_(False)
 
 
 def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
@@ -946,7 +897,9 @@ class Trainer:
                     "KTransformersPlugin could not be imported from `accelerate`. Please upgrade to a version that includes it."
                 )
             if isinstance(kt_config_dict, dict):
-                args["kt_config"] = KTransformersPlugin(**kt_config_dict)
+                enabled = bool(kt_config_dict.get("enabled", True))
+                kernel_config = {key: value for key, value in kt_config_dict.items() if key != "enabled"}
+                args["kt_config"] = KTransformersPlugin(enabled=enabled, kt_config=kernel_config)
             elif isinstance(kt_config_dict, KTransformersPlugin):
                 args["kt_config"] = kt_config_dict
             else:
@@ -1367,6 +1320,14 @@ class Trainer:
         if self.optimizer is None:
             decay_parameters = set(self.get_decay_parameter_names(opt_model))
             trainable_named_parameters = [(n, p) for n, p in opt_model.named_parameters() if p.requires_grad]
+            registered_parameter_ids = {id(parameter) for _, parameter in trainable_named_parameters}
+            for name, parameter in getattr(self, "_kt_optimizer_named_parameters", ()):
+                if id(parameter) in registered_parameter_ids:
+                    continue
+                trainable_named_parameters.append((name, parameter))
+                registered_parameter_ids.add(id(parameter))
+                # KT-owned optimizer tensors are matrix weights; apply the same decay policy as linear weights.
+                decay_parameters.add(name)
             if os.environ.get("USE_KT") == "1":
                 print(
                     f"[kt_smoke] trainer.create_optimizer: decay_names={len(decay_parameters)} "
@@ -1771,8 +1732,137 @@ class Trainer:
 
         return epochs_trained, steps_trained_in_current_epoch
 
+    def _load_kt_adapter_collectively(self, model: nn.Module, adapter_path: str, operation: str) -> None:
+        """Load KT-owned adapter state with identical failure and barrier behavior on every rank."""
+        from .integrations.kt_artifacts import load_kt_adapter_artifacts
+
+        local_error = None
+        try:
+            load_kt_adapter_artifacts(model, adapter_path)
+        except Exception as error:
+            local_error = error
+        self._raise_if_kt_checkpoint_failed(local_error, operation)
+        self._kt_checkpoint_barrier()
+        logger.info(f"Loaded KT-owned adapter tensors from {adapter_path}")
+
+    def _prepare_kt_for_training(self, max_steps, train_dataloader, resume_from_checkpoint):
+        """Prepare KT training in model, adaptation, optimizer, scheduler, then resume order."""
+        if self.is_deepspeed_enabled or self.is_fsdp_xla_enabled or is_sagemaker_mp_enabled():
+            raise RuntimeError("KT staged optimizer creation currently supports Accelerate and PyTorch FSDP only.")
+        if kt_adapt_peft_lora is None or get_kt_named_trainable_params is None:
+            raise ImportError("KT training requires a kt-kernel build exposing the public SFT adaptation APIs.")
+
+        if self._created_lr_scheduler:
+            self.lr_scheduler = None
+            self._created_lr_scheduler = False
+
+        self._kt_rank_local_parameter_names = ()
+        is_fsdp2 = self.is_fsdp_enabled and getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
+        if is_fsdp2:
+            if get_kt_rank_local_parameter_names is None:
+                raise ImportError(
+                    "KT FSDP2 training requires a kt-kernel build exposing `get_kt_rank_local_parameter_names`."
+                )
+            register_rank_local_parameters = getattr(
+                self.accelerator,
+                "register_fsdp2_rank_local_parameters",
+                None,
+            )
+            if register_rank_local_parameters is None:
+                raise RuntimeError(
+                    "KT FSDP2 training requires an Accelerate build exposing "
+                    "`Accelerator.register_fsdp2_rank_local_parameters`."
+                )
+            rank_local_parameter_names = tuple(get_kt_rank_local_parameter_names(self.model))
+            register_rank_local_parameters(self.model, rank_local_parameter_names)
+            self._kt_rank_local_parameter_names = rank_local_parameter_names
+
+        model = self._wrap_model(self.model_wrapped)
+        use_accelerator_prepare = model is self.model
+        if use_accelerator_prepare:
+            if self.is_fsdp_enabled and _is_peft_model(self.model):
+                update_fsdp_plugin_peft(self.model, self.accelerator)
+            # FSDP2 staged preparation leaves the optimizer until KT has created its final trainable tensors.
+            model = self.accelerator.prepare(self.model)
+
+        self.model_wrapped = model
+        if self.is_fsdp_enabled:
+            self.model = self.model_wrapped = model
+            if hasattr(self.model, "generate"):
+                dist.fsdp.register_fsdp_forward_method(self.model, "generate")
+
+        pc = getattr(self.accelerator, "parallelism_config", None)
+        if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
+            train_dataloader = self.accelerator.deepspeed_ulysses_dl_adapter(train_dataloader, model)
+
+        # FSDP checkpoints restore standard PEFT tensors only after the final FSDP parameter objects exist.
+        if resume_from_checkpoint is not None and self.is_fsdp_enabled:
+            self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        adaptation = kt_adapt_peft_lora(kt_model)
+        self._kt_optimizer_named_parameters = tuple(get_kt_named_trainable_params(kt_model))
+        self._kt_placeholder_names = tuple(getattr(adaptation, "placeholder_names", ()))
+        if is_fsdp2 and self._kt_placeholder_names != self._kt_rank_local_parameter_names:
+            raise RuntimeError(
+                "KT adaptation changed the FSDP2 rank-local base-parameter inventory after model preparation."
+            )
+        result_named_parameters = getattr(adaptation, "named_optimizer_parameters", None)
+        result_inventory = (
+            tuple((name, id(parameter)) for name, parameter in result_named_parameters)
+            if result_named_parameters is not None
+            else None
+        )
+        public_inventory = tuple((name, id(parameter)) for name, parameter in self._kt_optimizer_named_parameters)
+        if result_inventory is not None and result_inventory != public_inventory:
+            raise RuntimeError(
+                "KT adaptation returned an optimizer parameter inventory inconsistent with its public getter."
+            )
+
+        if resume_from_checkpoint is None:
+            if self.args.kt_adapter_name_or_path is not None:
+                self._load_kt_adapter_collectively(
+                    kt_model,
+                    self.args.kt_adapter_name_or_path,
+                    "fresh adapter load",
+                )
+        else:
+            self._load_kt_adapter_collectively(kt_model, resume_from_checkpoint, "resumed adapter load")
+
+        if self.optimizer is None:
+            self.create_optimizer(model)
+        else:
+            optimizer_parameter_ids = {
+                id(parameter) for group in self.optimizer.param_groups for parameter in group["params"]
+            }
+            missing = [
+                name
+                for name, parameter in self._kt_optimizer_named_parameters
+                if id(parameter) not in optimizer_parameter_ids
+            ]
+            if missing:
+                raise RuntimeError(
+                    "A user-supplied optimizer was created before KT adaptation and is missing parameters: "
+                    f"{missing}. Let Trainer create the optimizer after adaptation."
+                )
+        self.optimizer = self.accelerator.prepare(self.optimizer)
+
+        # The optimizer's parameter groups are final before scheduler construction and state restoration.
+        self.create_scheduler(num_training_steps=max_steps)
+        if resume_from_checkpoint is not None:
+            self._load_optimizer_and_scheduler(resume_from_checkpoint)
+            self._load_scaler(resume_from_checkpoint)
+
+        for attr in ("model", "optimizer", "lr_scheduler"):
+            setattr(self.callback_handler, attr, getattr(self, attr))
+        self.callback_handler.train_dataloader = train_dataloader
+        return model, train_dataloader
+
     def _prepare_for_training(self, max_steps, train_dataloader, resume_from_checkpoint):
         """Wrap model, create optimizer and scheduler, and run accelerator.prepare. Returns (model, train_dataloader)."""
+        if self.is_kt_enabled:
+            return self._prepare_kt_for_training(max_steps, train_dataloader, resume_from_checkpoint)
+
         delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
 
         # Can't delay optimizer creation when using FSDP2: https://github.com/huggingface/accelerate/blob/3f636d626063ffcf9a337c7d3624d61b7d187d59/src/accelerate/accelerator.py#L1404
@@ -1850,28 +1940,6 @@ class Trainer:
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             train_dataloader = self.accelerator.deepspeed_ulysses_dl_adapter(train_dataloader, model)
 
-        # KT LoRA adaptation: MUST happen AFTER all prepare() calls.
-        # FSDP2's prepare does model.to(meta) + load_state_dict(assign=True) which
-        # creates new param objects and destroys any .grad views set earlier.
-        kt_model = None
-        if self.is_kt_enabled:
-            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-
-        if kt_model is not None and kt_adapt_peft_lora is not None:
-            kt_adapt_peft_lora(kt_model)
-            _load_fresh_kt_adapter(kt_model, resume_from_checkpoint)
-
-            # Inject fused expert LoRA params into existing optimizer's last param group
-            # (cannot use add_param_group — lr_scheduler is already created with fixed group count)
-            if self.optimizer is not None and get_kt_lora_params is not None:
-                kt_lora_params = get_kt_lora_params(kt_model)
-                if kt_lora_params:
-                    existing_ids = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
-                    new_params = [p for p in kt_lora_params if id(p) not in existing_ids]
-                    if new_params:
-                        self.optimizer.param_groups[-1]["params"].extend(new_params)
-                        logger.info(f"Injected {len(new_params)} fused expert LoRA params into optimizer")
-
         # load checkpoint
         if resume_from_checkpoint is not None:
             if self.is_deepspeed_enabled:
@@ -1883,11 +1951,6 @@ class Trainer:
 
             self._load_optimizer_and_scheduler(resume_from_checkpoint)
             self._load_scaler(resume_from_checkpoint)
-
-            if kt_model is not None and load_kt_moe_from_adapter is not None:
-                from .integrations.kt_artifacts import load_kt_adapter_artifacts
-
-                load_kt_adapter_artifacts(kt_model, resume_from_checkpoint, load_kt_moe_from_adapter)
 
         # Update the references for the callback_handler
         for attr in ("model", "optimizer", "lr_scheduler"):
@@ -4200,9 +4263,19 @@ class Trainer:
         elif self.is_fsdp_enabled:
             is_fsdp2 = getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
             if self.is_kt_enabled and is_fsdp2 and _is_peft_model(self.model):
-                state_dict = _get_kt_fsdp2_peft_state_dict(self.model)
+                state_dict = self.accelerator.get_state_dict(
+                    self.model,
+                    adapter_only=True,
+                    excluded_parameter_names=getattr(self, "_kt_placeholder_names", ()),
+                )
+                save_error = None
                 if self.args.should_save:
-                    self._save(output_dir, state_dict=state_dict)
+                    try:
+                        self._save(output_dir, state_dict=state_dict)
+                    except Exception as error:
+                        save_error = error
+                self._raise_if_kt_checkpoint_failed(save_error, "adapter model save")
+                self._kt_checkpoint_barrier()
             elif "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
                 state_dict = self.accelerator.get_state_dict(self.model)
                 if self.args.should_save:
@@ -4237,7 +4310,11 @@ class Trainer:
 
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
-            self.push_to_hub(commit_message="Model save", revision=self.args.hub_revision)
+            self.push_to_hub(
+                commit_message="Model save",
+                revision=self.args.hub_revision,
+                _model_is_saved=True,
+            )
 
     def _save(self, output_dir: str | None = None, state_dict: dict | None = None) -> None:
         """Save model weights, configuration, and processing class to `output_dir`."""
@@ -4278,11 +4355,11 @@ class Trainer:
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
-        if self.is_kt_enabled and save_kt_moe_to_adapter is not None and self.args.should_save:
+        if self.is_kt_enabled and self.args.should_save:
             kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
             from .integrations.kt_artifacts import save_kt_adapter_artifacts
 
-            save_kt_adapter_artifacts(kt_model, output_dir, save_kt_moe_to_adapter)
+            save_kt_adapter_artifacts(kt_model, output_dir)
 
     # ---- Logging & Metrics ----
 
@@ -4463,6 +4540,8 @@ class Trainer:
         """
         self.callback_handler.on_push_begin(self.args, self.state, self.control)
 
+        model_is_saved = kwargs.pop("_model_is_saved", False)
+
         model_name = kwargs.pop("model_name", None)
         if model_name is None and self.args.should_save:
             if self.args.hub_model_id is None:
@@ -4477,7 +4556,8 @@ class Trainer:
 
         # Needs to be executed on all processes for TPU training, but will only save on the processed determined by
         # self.args.should_save.
-        self.save_model(_internal_call=True)
+        if not model_is_saved:
+            self.save_model(_internal_call=True)
 
         # Only push from one node.
         if not self.is_world_process_zero():
