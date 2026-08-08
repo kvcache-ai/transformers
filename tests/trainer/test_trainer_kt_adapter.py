@@ -261,7 +261,8 @@ class TrainerKTAdapterTest(unittest.TestCase):
 
         with (
             patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
-            patch("transformers.trainer._is_peft_model", return_value=False),
+            patch("transformers.trainer._is_peft_model", return_value=True),
+            patch("transformers.trainer.update_fsdp_plugin_peft") as update_peft_policy,
             patch(
                 "transformers.trainer.get_kt_rank_local_parameter_names",
                 return_value=("model.layers.0.mlp.experts.gate_up_proj",),
@@ -277,6 +278,7 @@ class TrainerKTAdapterTest(unittest.TestCase):
         ):
             trainer._prepare_kt_for_training(10, object(), None)
 
+        update_peft_policy.assert_not_called()
         self.assertEqual(
             events[:3],
             [

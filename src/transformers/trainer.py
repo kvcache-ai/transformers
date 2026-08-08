@@ -1793,7 +1793,8 @@ class Trainer:
         model = self._wrap_model(self.model_wrapped)
         use_accelerator_prepare = model is self.model
         if use_accelerator_prepare:
-            if self.is_fsdp_enabled and _is_peft_model(self.model):
+            # PEFT's recursive policy is FSDP1-only; FSDP2 keeps its module policy.
+            if self.is_fsdp_enabled and not is_fsdp2 and _is_peft_model(self.model):
                 update_fsdp_plugin_peft(self.model, self.accelerator)
             # FSDP2 staged preparation leaves the optimizer until KT has created its final trainable tensors.
             model = self.accelerator.prepare(self.model)
