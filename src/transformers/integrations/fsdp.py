@@ -55,19 +55,30 @@ def is_fsdp_enabled():
     return False
 
 
-def get_fsdp_ckpt_kwargs():
+def get_fsdp_ckpt_kwargs(excluded_parameter_names=()):
     """
-    Returns checkpoint kwargs for FSDP model saving.
+    Returns checkpoint kwargs for FSDP model save and load.
 
-    Checks if the `adapter_only` parameter is supported by `save_fsdp_model` from accelerate
-    and returns the appropriate kwargs.
+    Selective exclusions require matching support in both Accelerate checkpoint directions.
     """
-    from accelerate.utils import save_fsdp_model
+    from accelerate.utils import load_fsdp_model, save_fsdp_model
 
-    if "adapter_only" in list(inspect.signature(save_fsdp_model).parameters):
-        return {"adapter_only": True}
-    else:
+    save_parameters = inspect.signature(save_fsdp_model).parameters
+    excluded_parameter_names = tuple(excluded_parameter_names)
+    if "adapter_only" not in save_parameters:
+        if excluded_parameter_names:
+            raise RuntimeError("KT FSDP2 checkpoints require Accelerate `adapter_only` checkpoint support.")
         return {}
+
+    kwargs = {"adapter_only": True}
+    if excluded_parameter_names:
+        load_parameters = inspect.signature(load_fsdp_model).parameters
+        if "excluded_parameter_names" not in save_parameters or "excluded_parameter_names" not in load_parameters:
+            raise RuntimeError(
+                "KT FSDP2 checkpoints require Accelerate save/load support for `excluded_parameter_names`."
+            )
+        kwargs["excluded_parameter_names"] = excluded_parameter_names
+    return kwargs
 
 
 def update_fsdp_plugin_peft(model, accelerator):

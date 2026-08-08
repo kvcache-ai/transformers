@@ -1767,6 +1767,7 @@ class Trainer:
             self._created_lr_scheduler = False
 
         self._kt_rank_local_parameter_names = ()
+        self._kt_placeholder_names = ()
         is_fsdp2 = self.is_fsdp_enabled and getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
         if is_fsdp2:
             if get_kt_rank_local_parameter_names is None:
@@ -1784,8 +1785,10 @@ class Trainer:
                     "`Accelerator.register_fsdp2_rank_local_parameters`."
                 )
             rank_local_parameter_names = tuple(get_kt_rank_local_parameter_names(self.model))
+            get_fsdp_ckpt_kwargs(rank_local_parameter_names)
             register_rank_local_parameters(self.model, rank_local_parameter_names)
             self._kt_rank_local_parameter_names = rank_local_parameter_names
+            self._kt_placeholder_names = rank_local_parameter_names
 
         model = self._wrap_model(self.model_wrapped)
         use_accelerator_prepare = model is self.model
@@ -3732,7 +3735,11 @@ class Trainer:
         elif self.is_fsdp_enabled:
             # save fsdp specific ckpt for resuming from ckpt
             save_fsdp_model(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **get_fsdp_ckpt_kwargs()
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                self.model,
+                output_dir,
+                **get_fsdp_ckpt_kwargs(getattr(self, "_kt_placeholder_names", ())),
             )
             # KT params are not managed by FSDP, so save each rank's optimizer state separately. Optimizer parameter
             # groups differ by rank, and a shared rank-0 state dict cannot be loaded safely on the other ranks.
@@ -3873,7 +3880,7 @@ class Trainer:
                     self.accelerator,
                     model,
                     resume_from_checkpoint,
-                    **get_fsdp_ckpt_kwargs(),
+                    **get_fsdp_ckpt_kwargs(getattr(self, "_kt_placeholder_names", ())),
                 )
             else:
                 # We load the model state dict on the CPU to avoid an OOM error.
@@ -3942,7 +3949,7 @@ class Trainer:
                 self.accelerator,
                 model,
                 self.state.best_model_checkpoint,
-                **get_fsdp_ckpt_kwargs(),
+                **get_fsdp_ckpt_kwargs(getattr(self, "_kt_placeholder_names", ())),
             )
         elif (
             os.path.exists(best_model_path)

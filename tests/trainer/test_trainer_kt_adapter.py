@@ -20,6 +20,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from transformers.integrations.fsdp import get_fsdp_ckpt_kwargs
 from transformers.trainer import Trainer
 from transformers.trainer_utils import HubStrategy, SaveStrategy
 
@@ -62,6 +63,82 @@ class _GradNormAccelerator:
 
 
 class TrainerKTAdapterTest(unittest.TestCase):
+    def test_fsdp_checkpoint_kwargs_require_bidirectional_exclusion_support(self):
+        def legacy_save(*args, adapter_only=False):
+            pass
+
+        def supported_load(*args, adapter_only=False, excluded_parameter_names=()):
+            pass
+
+        with (
+            patch("accelerate.utils.save_fsdp_model", legacy_save),
+            patch("accelerate.utils.load_fsdp_model", supported_load),
+            self.assertRaisesRegex(RuntimeError, "excluded_parameter_names"),
+        ):
+            get_fsdp_ckpt_kwargs(("placeholder",))
+
+        def supported_save(*args, adapter_only=False, excluded_parameter_names=()):
+            pass
+
+        with (
+            patch("accelerate.utils.save_fsdp_model", supported_save),
+            patch("accelerate.utils.load_fsdp_model", supported_load),
+        ):
+            self.assertEqual(
+                get_fsdp_ckpt_kwargs(("placeholder",)),
+                {"adapter_only": True, "excluded_parameter_names": ("placeholder",)},
+            )
+
+    def test_fsdp_resume_checkpoint_propagates_placeholder_exclusions(self):
+        trainer = object.__new__(Trainer)
+        trainer.model = torch.nn.Linear(2, 2)
+        trainer.is_fsdp_enabled = True
+        trainer._kt_placeholder_names = ("placeholder",)
+        trainer.accelerator = SimpleNamespace(state=SimpleNamespace(fsdp_plugin=object()))
+
+        with tempfile.TemporaryDirectory() as checkpoint_dir:
+            torch.save({}, os.path.join(checkpoint_dir, "pytorch_model_fsdp.bin"))
+            with (
+                patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
+                patch("transformers.trainer.load_fsdp_model") as load_fsdp,
+            ):
+                trainer._load_from_checkpoint(checkpoint_dir)
+
+        load_fsdp.assert_called_once_with(
+            trainer.accelerator.state.fsdp_plugin,
+            trainer.accelerator,
+            trainer.model,
+            checkpoint_dir,
+            adapter_only=True,
+            excluded_parameter_names=trainer._kt_placeholder_names,
+        )
+
+    def test_fsdp_training_checkpoint_propagates_placeholder_exclusions(self):
+        trainer = object.__new__(Trainer)
+        trainer.args = SimpleNamespace(world_size=1, should_save=False)
+        trainer.is_deepspeed_enabled = False
+        trainer.is_fsdp_enabled = True
+        trainer.is_kt_enabled = True
+        trainer.model = torch.nn.Linear(2, 2)
+        trainer._kt_placeholder_names = ("placeholder",)
+        trainer.accelerator = SimpleNamespace(state=SimpleNamespace(fsdp_plugin=object()))
+
+        with (
+            patch("transformers.trainer.is_torch_xla_available", return_value=False),
+            patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
+            patch("transformers.trainer.save_fsdp_model") as save_fsdp,
+        ):
+            trainer._save_optimizer_and_scheduler("/tmp/checkpoint")
+
+        save_fsdp.assert_called_once_with(
+            trainer.accelerator.state.fsdp_plugin,
+            trainer.accelerator,
+            trainer.model,
+            "/tmp/checkpoint",
+            adapter_only=True,
+            excluded_parameter_names=trainer._kt_placeholder_names,
+        )
+
     def test_fsdp2_save_uses_public_adapter_only_state_api(self):
         trainer = object.__new__(Trainer)
         trainer.args = SimpleNamespace(
@@ -243,7 +320,9 @@ class TrainerKTAdapterTest(unittest.TestCase):
             model=None, optimizer=None, lr_scheduler=None, train_dataloader=None
         )
         trainer._wrap_model = Mock(return_value=model)
-        trainer._load_from_checkpoint = Mock(side_effect=lambda *_args: events.append("load_standard_adapter"))
+        trainer._load_from_checkpoint = Mock(
+            side_effect=lambda *_args: events.append(("load_standard_adapter", trainer._kt_placeholder_names))
+        )
         trainer._load_kt_adapter_collectively = Mock(side_effect=lambda *_args: events.append("load_fused_adapter"))
         trainer._load_optimizer_and_scheduler = Mock(side_effect=lambda *_args: events.append("load_optimizer"))
         trainer._load_scaler = Mock(side_effect=lambda *_args: events.append("load_scaler"))
@@ -262,10 +341,13 @@ class TrainerKTAdapterTest(unittest.TestCase):
         with (
             patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
             patch("transformers.trainer._is_peft_model", return_value=False),
-            patch("transformers.trainer.get_kt_rank_local_parameter_names", return_value=()),
+            patch("transformers.trainer.get_kt_rank_local_parameter_names", return_value=("placeholder",)),
             patch(
                 "transformers.trainer.kt_adapt_peft_lora",
-                side_effect=lambda _model: (events.append("adapt"), SimpleNamespace(placeholder_names=()))[1],
+                side_effect=lambda _model: (
+                    events.append("adapt"),
+                    SimpleNamespace(placeholder_names=("placeholder",)),
+                )[1],
             ),
             patch("transformers.trainer.get_kt_named_trainable_params", return_value=[]),
         ):
@@ -274,9 +356,9 @@ class TrainerKTAdapterTest(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("register_rank_local", model, ()),
+                ("register_rank_local", model, ("placeholder",)),
                 "prepare_model",
-                "load_standard_adapter",
+                ("load_standard_adapter", ("placeholder",)),
                 "adapt",
                 "load_fused_adapter",
                 "create_optimizer",
