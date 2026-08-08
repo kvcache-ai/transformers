@@ -323,6 +323,10 @@ def _atomic_json_save(payload: dict[str, Any], destination: str) -> None:
         raise
 
 
+def _resolve_kt_artifact_path(path: str | os.PathLike) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
 def _read_kt_optimizer_manifest(checkpoint: str, expected_world_size: int) -> list[str]:
     manifest_path = os.path.join(checkpoint, KT_OPTIMIZER_INDEX_NAME)
     try:
@@ -1734,6 +1738,7 @@ class Trainer:
 
         local_error = None
         try:
+            adapter_path = _resolve_kt_artifact_path(adapter_path)
             load_kt_adapter_artifacts(model, adapter_path)
         except Exception as error:
             local_error = error

@@ -334,6 +334,43 @@ class TrainerKTAdapterTest(unittest.TestCase):
         trainer._raise_if_kt_checkpoint_failed.assert_called_once_with(failure, "fresh adapter load")
         trainer._kt_checkpoint_barrier.assert_called_once_with()
 
+    def test_collective_adapter_load_resolves_relative_paths_before_public_api(self):
+        trainer = object.__new__(Trainer)
+        trainer._raise_if_kt_checkpoint_failed = Mock()
+        trainer._kt_checkpoint_barrier = Mock()
+        model = object()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            adapter_path = os.path.join(temporary_directory, "adapter")
+            os.mkdir(adapter_path)
+            adapter_link = os.path.join(temporary_directory, "adapter-link")
+            os.symlink(adapter_path, adapter_link, target_is_directory=True)
+            relative_path = os.path.relpath(adapter_link)
+            with patch("transformers.integrations.kt_artifacts.load_kt_adapter_artifacts") as load_adapter:
+                for operation in ("fresh adapter load", "resumed adapter load", "best adapter load"):
+                    with self.subTest(operation=operation):
+                        load_adapter.reset_mock()
+                        trainer._load_kt_adapter_collectively(model, relative_path, operation)
+                        load_adapter.assert_called_once_with(model, os.path.realpath(adapter_path))
+
+        self.assertEqual(trainer._kt_checkpoint_barrier.call_count, 3)
+
+    def test_collective_adapter_load_synchronizes_path_resolution_failure(self):
+        trainer = object.__new__(Trainer)
+        trainer._raise_if_kt_checkpoint_failed = Mock()
+        trainer._kt_checkpoint_barrier = Mock()
+        failure = OSError("cannot resolve adapter path")
+
+        with (
+            patch("transformers.trainer._resolve_kt_artifact_path", side_effect=failure),
+            patch("transformers.integrations.kt_artifacts.load_kt_adapter_artifacts") as load_adapter,
+        ):
+            trainer._load_kt_adapter_collectively(object(), "adapter", "resumed adapter load")
+
+        load_adapter.assert_not_called()
+        trainer._raise_if_kt_checkpoint_failed.assert_called_once_with(failure, "resumed adapter load")
+        trainer._kt_checkpoint_barrier.assert_called_once_with()
+
     def test_user_optimizer_inventory_matches_staged_kt_parameters(self):
         events = []
         model = torch.nn.Linear(2, 2)
