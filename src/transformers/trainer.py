@@ -1747,6 +1747,15 @@ class Trainer:
             raise RuntimeError("KT staged optimizer creation currently supports Accelerate and PyTorch FSDP only.")
         if kt_adapt_peft_lora is None or get_kt_named_trainable_params is None:
             raise ImportError("KT training requires a kt-kernel build exposing the public SFT adaptation APIs.")
+        clip_grad_norm = getattr(self.accelerator, "clip_grad_norm_", None)
+        try:
+            clip_grad_norm_parameters = inspect.signature(clip_grad_norm).parameters
+        except (TypeError, ValueError):
+            clip_grad_norm_parameters = {}
+        if "rank_local_parameters" not in clip_grad_norm_parameters:
+            raise RuntimeError(
+                "KT training requires an Accelerate build whose `clip_grad_norm_` supports `rank_local_parameters`."
+            )
 
         if self._created_lr_scheduler:
             self.lr_scheduler = None
@@ -1814,6 +1823,16 @@ class Trainer:
             raise RuntimeError(
                 "KT adaptation returned an optimizer parameter inventory inconsistent with its public getter."
             )
+        model_parameter_ids = {id(parameter) for parameter in model.parameters()}
+        rank_local_parameter_ids = set()
+        rank_local_parameters = []
+        for _, parameter in self._kt_optimizer_named_parameters:
+            parameter_id = id(parameter)
+            if parameter_id in model_parameter_ids or parameter_id in rank_local_parameter_ids:
+                continue
+            rank_local_parameter_ids.add(parameter_id)
+            rank_local_parameters.append(parameter)
+        self._kt_rank_local_optimizer_parameters = tuple(rank_local_parameters)
 
         if resume_from_checkpoint is None:
             if self.args.kt_adapter_name_or_path is not None:
@@ -1825,22 +1844,24 @@ class Trainer:
         else:
             self._load_kt_adapter_collectively(kt_model, resume_from_checkpoint, "resumed adapter load")
 
-        if self.optimizer is None:
+        user_supplied_optimizer = self.optimizer is not None
+        if not user_supplied_optimizer:
             self.create_optimizer(model)
-        else:
-            optimizer_parameter_ids = {
-                id(parameter) for group in self.optimizer.param_groups for parameter in group["params"]
-            }
-            missing = [
-                name
-                for name, parameter in self._kt_optimizer_named_parameters
-                if id(parameter) not in optimizer_parameter_ids
-            ]
-            if missing:
+        optimizer_parameter_ids = {
+            id(parameter) for group in self.optimizer.param_groups for parameter in group["params"]
+        }
+        missing = [
+            name
+            for name, parameter in self._kt_optimizer_named_parameters
+            if id(parameter) not in optimizer_parameter_ids
+        ]
+        if missing:
+            if user_supplied_optimizer:
                 raise RuntimeError(
                     "A user-supplied optimizer was created before KT adaptation and is missing parameters: "
                     f"{missing}. Let Trainer create the optimizer after adaptation."
                 )
+            raise RuntimeError(f"Trainer's optimizer is missing KT parameters after staged adaptation: {missing}.")
         self.optimizer = self.accelerator.prepare(self.optimizer)
 
         # The optimizer's parameter groups are final before scheduler construction and state restoration.
@@ -2805,13 +2826,26 @@ class Trainer:
         """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
         if is_sagemaker_mp_enabled() and self.args.fp16:
             return self.optimizer.clip_master_grads(self.args.max_grad_norm)
+        if self.is_kt_enabled:
+            return self.accelerator.clip_grad_norm_(
+                model.parameters(),
+                self.args.max_grad_norm,
+                rank_local_parameters=getattr(self, "_kt_rank_local_optimizer_parameters", ()),
+            )
         return self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
 
     def _get_grad_norm(self, model, grad_norm=None):
         """Return the gradient norm as a Python float."""
         if grad_norm is None:
             # Compute norm without clipping (inf means no actual clipping happens)
-            grad_norm = self.accelerator.clip_grad_norm_(model.parameters(), float("inf"))
+            if self.is_kt_enabled:
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    model.parameters(),
+                    float("inf"),
+                    rank_local_parameters=getattr(self, "_kt_rank_local_optimizer_parameters", ()),
+                )
+            else:
+                grad_norm = self.accelerator.clip_grad_norm_(model.parameters(), float("inf"))
 
         if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
             if hasattr(grad_norm, "item"):

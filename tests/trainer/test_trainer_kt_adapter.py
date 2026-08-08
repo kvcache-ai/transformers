@@ -41,6 +41,25 @@ class _StagedAccelerator:
     def unwrap_model(self, _model, keep_torch_compile=False):
         return self.model
 
+    def clip_grad_norm_(self, parameters, max_norm, norm_type=2, *, rank_local_parameters=None):
+        raise AssertionError("gradient clipping is not expected during staged preparation")
+
+
+_UNSET = object()
+
+
+class _GradNormAccelerator:
+    distributed_type = None
+
+    def __init__(self):
+        self.calls = []
+
+    def clip_grad_norm_(self, parameters, max_norm, norm_type=2, *, rank_local_parameters=_UNSET):
+        model_parameters = list(parameters)
+        extras = [] if rank_local_parameters is _UNSET else list(rank_local_parameters)
+        self.calls.append((max_norm, rank_local_parameters))
+        return torch.nn.utils.clip_grad_norm_([*model_parameters, *extras], max_norm, norm_type)
+
 
 class TrainerKTAdapterTest(unittest.TestCase):
     def test_fsdp2_save_uses_public_adapter_only_state_api(self):
@@ -131,6 +150,7 @@ class TrainerKTAdapterTest(unittest.TestCase):
             ],
         )
         self.assertEqual(trainer._kt_placeholder_names, ("placeholder",))
+        self.assertEqual(trainer._kt_rank_local_optimizer_parameters, (kt_parameter,))
         trainer._load_kt_adapter_collectively.assert_called_once_with(
             model,
             "/tmp/adapter",
@@ -188,6 +208,23 @@ class TrainerKTAdapterTest(unittest.TestCase):
                 "create_optimizer",
             ],
         )
+        self.assertEqual(trainer._kt_rank_local_optimizer_parameters, ())
+
+    def test_staged_lifecycle_rejects_accelerate_without_rank_local_grad_norm_api(self):
+        trainer = object.__new__(Trainer)
+        trainer.is_deepspeed_enabled = False
+        trainer.is_fsdp_xla_enabled = False
+        trainer.accelerator = SimpleNamespace(clip_grad_norm_=lambda parameters, max_norm: None)
+
+        with (
+            patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
+            patch("transformers.trainer.kt_adapt_peft_lora") as adapt,
+            patch("transformers.trainer.get_kt_named_trainable_params", return_value=[]),
+            self.assertRaisesRegex(RuntimeError, "rank_local_parameters"),
+        ):
+            trainer._prepare_kt_for_training(10, object(), None)
+
+        adapt.assert_not_called()
 
     def test_fsdp2_resume_restores_standard_then_fused_then_optimizer_state(self):
         events = []
@@ -296,6 +333,129 @@ class TrainerKTAdapterTest(unittest.TestCase):
 
         trainer._raise_if_kt_checkpoint_failed.assert_called_once_with(failure, "fresh adapter load")
         trainer._kt_checkpoint_barrier.assert_called_once_with()
+
+    def test_user_optimizer_inventory_matches_staged_kt_parameters(self):
+        events = []
+        model = torch.nn.Linear(2, 2)
+        kt_parameter = torch.nn.Parameter(torch.ones(2, 2))
+        named_parameters = (("kt.layers.0.experts.fused_lora.gate_lora_a", kt_parameter),)
+        trainer = object.__new__(Trainer)
+        trainer.is_deepspeed_enabled = False
+        trainer.is_fsdp_xla_enabled = False
+        trainer.is_fsdp_enabled = False
+        trainer._created_lr_scheduler = False
+        trainer.model = trainer.model_wrapped = model
+        trainer.optimizer = torch.optim.SGD([*model.parameters(), kt_parameter], lr=0.1)
+        trainer.lr_scheduler = None
+        trainer.args = SimpleNamespace(kt_adapter_name_or_path=None)
+        trainer.accelerator = _StagedAccelerator(model, events)
+        trainer.callback_handler = SimpleNamespace(
+            model=None, optimizer=None, lr_scheduler=None, train_dataloader=None
+        )
+        trainer._wrap_model = Mock(return_value=model)
+        trainer.create_optimizer = Mock()
+        trainer.create_scheduler = Mock()
+
+        with (
+            patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
+            patch(
+                "transformers.trainer.kt_adapt_peft_lora",
+                return_value=SimpleNamespace(named_optimizer_parameters=named_parameters, placeholder_names=()),
+            ),
+            patch("transformers.trainer.get_kt_named_trainable_params", return_value=list(named_parameters)),
+        ):
+            trainer._prepare_kt_for_training(10, object(), None)
+
+        trainer.create_optimizer.assert_not_called()
+        self.assertEqual(trainer._kt_rank_local_optimizer_parameters, (kt_parameter,))
+        self.assertIn("prepare_optimizer", events)
+
+    def test_user_optimizer_missing_staged_kt_parameter_fails_before_prepare(self):
+        events = []
+        model = torch.nn.Linear(2, 2)
+        kt_parameter = torch.nn.Parameter(torch.ones(2, 2))
+        named_parameters = (("kt.layers.0.experts.fused_lora.gate_lora_a", kt_parameter),)
+        trainer = object.__new__(Trainer)
+        trainer.is_deepspeed_enabled = False
+        trainer.is_fsdp_xla_enabled = False
+        trainer.is_fsdp_enabled = False
+        trainer._created_lr_scheduler = False
+        trainer.model = trainer.model_wrapped = model
+        trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        trainer.lr_scheduler = None
+        trainer.args = SimpleNamespace(kt_adapter_name_or_path=None)
+        trainer.accelerator = _StagedAccelerator(model, events)
+        trainer.callback_handler = SimpleNamespace(
+            model=None, optimizer=None, lr_scheduler=None, train_dataloader=None
+        )
+        trainer._wrap_model = Mock(return_value=model)
+
+        with (
+            patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False),
+            patch(
+                "transformers.trainer.kt_adapt_peft_lora",
+                return_value=SimpleNamespace(named_optimizer_parameters=named_parameters, placeholder_names=()),
+            ),
+            patch("transformers.trainer.get_kt_named_trainable_params", return_value=list(named_parameters)),
+            self.assertRaisesRegex(RuntimeError, "user-supplied optimizer.*missing parameters"),
+        ):
+            trainer._prepare_kt_for_training(10, object(), None)
+
+        self.assertNotIn("prepare_optimizer", events)
+
+    def test_kt_grad_norm_includes_rank_local_parameters_for_clip_and_report(self):
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.zeros(()))
+        model.weight.grad = torch.tensor(3.0)
+        kt_parameter = torch.nn.Parameter(torch.zeros(()))
+        kt_parameter.grad = torch.tensor(4.0)
+        accelerator = _GradNormAccelerator()
+        trainer = object.__new__(Trainer)
+        trainer.args = SimpleNamespace(fp16=False, max_grad_norm=100.0)
+        trainer.accelerator = accelerator
+        trainer.is_kt_enabled = True
+        trainer._kt_rank_local_optimizer_parameters = (kt_parameter,)
+
+        with patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False):
+            clipped_norm = trainer._clip_grad_norm(model)
+            reported_norm = trainer._get_grad_norm(model)
+
+        self.assertAlmostEqual(clipped_norm.item(), 5.0)
+        self.assertAlmostEqual(reported_norm.item(), 5.0)
+        self.assertEqual(accelerator.calls[0], (100.0, (kt_parameter,)))
+        self.assertEqual(accelerator.calls[1], (float("inf"), (kt_parameter,)))
+
+    def test_kt_nonowner_passes_empty_rank_local_inventory(self):
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.zeros(()))
+        model.weight.grad = torch.tensor(3.0)
+        accelerator = _GradNormAccelerator()
+        trainer = object.__new__(Trainer)
+        trainer.accelerator = accelerator
+        trainer.is_kt_enabled = True
+        trainer._kt_rank_local_optimizer_parameters = ()
+
+        norm = trainer._get_grad_norm(model)
+
+        self.assertAlmostEqual(norm.item(), 3.0)
+        self.assertEqual(accelerator.calls, [(float("inf"), ())])
+
+    def test_non_kt_grad_norm_calls_accelerate_without_rank_local_contract(self):
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.zeros(()))
+        model.weight.grad = torch.tensor(3.0)
+        accelerator = _GradNormAccelerator()
+        trainer = object.__new__(Trainer)
+        trainer.args = SimpleNamespace(fp16=False, max_grad_norm=100.0)
+        trainer.accelerator = accelerator
+        trainer.is_kt_enabled = False
+
+        with patch("transformers.trainer.is_sagemaker_mp_enabled", return_value=False):
+            trainer._clip_grad_norm(model)
+            trainer._get_grad_norm(model)
+
+        self.assertIs(accelerator.calls[0][1], _UNSET)
+        self.assertIs(accelerator.calls[1][1], _UNSET)
 
     def test_create_optimizer_groups_unregistered_kt_matrix_weights_before_construction(self):
         model = torch.nn.Linear(2, 2)
