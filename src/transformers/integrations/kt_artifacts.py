@@ -110,36 +110,6 @@ def hide_kt_routed_experts_from_dispatch(model: Any):
         yield
 
 
-@contextlib.contextmanager
-def project_kt_int8_routed_experts_out_of_device_map(model: Any):
-    try:
-        artifacts = _artifacts_api()
-    except ImportError:
-        yield
-        return
-    with artifacts.project_kt_int8_routed_experts_out_of_device_map(model):
-        yield
-
-
-def prepare_kt_int8_non_expert_device_map(model: Any, device_map: Any):
-    try:
-        artifacts = _artifacts_api()
-    except ImportError:
-        return device_map
-    return artifacts.prepare_kt_int8_non_expert_device_map(model, device_map)
-
-
-@contextlib.contextmanager
-def hide_kt_int8_routed_experts_from_dispatch(model: Any):
-    try:
-        artifacts = _artifacts_api()
-    except ImportError:
-        yield
-        return
-    with artifacts.hide_kt_int8_routed_experts_from_dispatch(model):
-        yield
-
-
 def save_kt_adapter_artifacts(model: Any, output_dir: str, *_legacy_callbacks: Any):
     return _artifacts_api().save_kt_adapter_artifacts(model, output_dir)
 

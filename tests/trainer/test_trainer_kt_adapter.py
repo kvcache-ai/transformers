@@ -22,7 +22,6 @@ import torch
 
 from transformers.integrations.fsdp import get_fsdp_ckpt_kwargs
 from transformers.trainer import Trainer
-from transformers.trainer_utils import HubStrategy, SaveStrategy
 
 
 class _StagedAccelerator:
@@ -617,56 +616,6 @@ class TrainerKTAdapterTest(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "KT-managed parameters outside the model tree"),
                 ):
                     trainer.create_optimizer()
-
-    def test_push_from_checkpoint_republishes_complete_kt_bundle_at_output_root(self):
-        trainer = object.__new__(Trainer)
-        trainer.is_kt_enabled = True
-        trainer.is_world_process_zero = lambda: True
-        trainer.model = torch.nn.Linear(2, 2)
-        kt_model = object()
-        trainer.accelerator = SimpleNamespace(unwrap_model=Mock(return_value=kt_model))
-        trainer.callback_handler = SimpleNamespace(on_push_begin=Mock())
-        trainer.control = object()
-        trainer.state = SimpleNamespace(global_step=7, epoch=1.0)
-        trainer.processing_class = None
-        trainer.push_in_progress = None
-        trainer.hub_model_id = "organization/model"
-
-        with tempfile.TemporaryDirectory() as root:
-            checkpoint = os.path.join(root, "checkpoint-7")
-            output_dir = os.path.join(root, "output")
-            os.makedirs(checkpoint)
-            os.makedirs(output_dir)
-            for filename in ("adapter_config.json", "adapter_model.safetensors"):
-                open(os.path.join(checkpoint, filename), "wb").close()
-            trainer.args = SimpleNamespace(
-                output_dir=output_dir,
-                hub_strategy=HubStrategy.EVERY_SAVE,
-                hub_always_push=False,
-                save_strategy=SaveStrategy.STEPS,
-                hub_token=None,
-                hub_revision=None,
-            )
-
-            def save_bundle(_model, destination):
-                open(os.path.join(destination, "kt_adapter_manifest.json"), "wb").close()
-                open(os.path.join(destination, "kt_fused_lora.safetensors"), "wb").close()
-
-            with (
-                patch("transformers.trainer.is_peft_available", return_value=True),
-                patch(
-                    "transformers.integrations.kt_artifacts.save_kt_adapter_artifacts",
-                    side_effect=save_bundle,
-                ) as save_kt,
-                patch("transformers.trainer.upload_folder", return_value=Mock()) as upload,
-            ):
-                trainer._push_from_checkpoint(checkpoint)
-
-            self.assertTrue(os.path.isfile(os.path.join(output_dir, "adapter_model.safetensors")))
-            self.assertTrue(os.path.isfile(os.path.join(output_dir, "kt_adapter_manifest.json")))
-            self.assertTrue(os.path.isfile(os.path.join(output_dir, "kt_fused_lora.safetensors")))
-            save_kt.assert_called_once_with(kt_model, output_dir)
-            upload.assert_called_once()
 
 
 if __name__ == "__main__":

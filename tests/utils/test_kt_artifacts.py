@@ -21,12 +21,10 @@ from transformers.integrations.accelerate import _get_device_map, accelerate_dis
 from transformers.integrations.kt import HfTrainerKTConfig, unset_kt_config
 from transformers.integrations.kt_artifacts import (
     claim_kt_routed_expert_subtrees,
-    hide_kt_int8_routed_experts_from_dispatch,
     hide_kt_routed_experts_from_dispatch,
     load_kt_adapter_artifacts,
     mark_kt_int8_routed_expert_base_parameters,
     prepare_kt_non_expert_device_map,
-    project_kt_int8_routed_experts_out_of_device_map,
     project_kt_routed_experts_out_of_device_map,
     resolve_kt_pretrained_artifacts,
     save_kt_adapter_artifacts,
@@ -107,6 +105,13 @@ class KTArtifactBridgeTest(unittest.TestCase):
         api.assert_not_called()
 
     def test_device_contexts_are_delegated(self):
+        self.kt_config = HfTrainerKTConfig(
+            {
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_expert_weight_format": "bf16",
+            }
+        )
         events = []
 
         @contextlib.contextmanager
@@ -116,13 +121,13 @@ class KTArtifactBridgeTest(unittest.TestCase):
             events.append(f"exit:{label}")
 
         api = SimpleNamespace(
-            project_kt_int8_routed_experts_out_of_device_map=lambda _model: context("project"),
-            hide_kt_int8_routed_experts_from_dispatch=lambda _model: context("dispatch"),
+            project_kt_routed_experts_out_of_device_map=lambda _model: context("project"),
+            hide_kt_routed_experts_from_dispatch=lambda _model: context("dispatch"),
         )
         with patch("transformers.integrations.kt_artifacts._artifacts_api", return_value=api):
-            with project_kt_int8_routed_experts_out_of_device_map(object()):
+            with project_kt_routed_experts_out_of_device_map(object()):
                 events.append("project")
-            with hide_kt_int8_routed_experts_from_dispatch(object()):
+            with hide_kt_routed_experts_from_dispatch(object()):
                 events.append("dispatch")
 
         self.assertEqual(

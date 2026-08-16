@@ -21,7 +21,6 @@ import torch
 from transformers import BertConfig, BertModel
 from transformers.integrations.kt import (
     HfTrainerKTConfig,
-    _validate_kt_int8_loading_info,
     _validate_kt_prequantized_loading_info,
     is_kt_fp8_expert_loading_enabled,
     is_kt_prequantized_expert_loading_enabled,
@@ -70,14 +69,14 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
         )
 
         deepseek_model = SimpleNamespace(config=SimpleNamespace(model_type="deepseek_v3", num_hidden_layers=61))
-        _validate_kt_int8_loading_info(info, deepseek_model)
+        _validate_kt_prequantized_loading_info(info, deepseek_model)
 
     def test_rejects_mtp_shaped_unexpected_key_for_other_models(self):
         self.enable_int8()
         other_model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3_moe", num_hidden_layers=61))
 
         with self.assertRaisesRegex(RuntimeError, "unexpected_keys"):
-            _validate_kt_int8_loading_info(
+            _validate_kt_prequantized_loading_info(
                 _loading_info(unexpected_keys={"model.layers.61.self_attn.q_proj.weight"}),
                 other_model,
             )
@@ -100,7 +99,7 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
         for field, value in failures.items():
             with self.subTest(field=field):
                 with self.assertRaisesRegex(RuntimeError, field):
-                    _validate_kt_int8_loading_info(_loading_info(**{field: value}))
+                    _validate_kt_prequantized_loading_info(_loading_info(**{field: value}))
 
     def test_non_int8_loading_is_unchanged(self):
         self.kt_config = HfTrainerKTConfig(
@@ -111,7 +110,7 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
             }
         )
 
-        _validate_kt_int8_loading_info(
+        _validate_kt_prequantized_loading_info(
             _loading_info(
                 missing_keys={"model.layers.3.self_attn.q_proj.weight"},
                 unexpected_keys={"model.layers.60.unrecognized.weight"},

@@ -4681,11 +4681,6 @@ class Trainer:
         for modeling_file in modeling_files:
             if os.path.isfile(os.path.join(checkpoint_folder, modeling_file)):
                 shutil.copy(os.path.join(checkpoint_folder, modeling_file), os.path.join(output_dir, modeling_file))
-        if self.is_kt_enabled:
-            from .integrations.kt_artifacts import save_kt_adapter_artifacts
-
-            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-            save_kt_adapter_artifacts(kt_model, output_dir)
         # Saving the processing class is fast and we don't know how many files it may have spawned, so we resave it to be sure.
         if self.processing_class is not None:
             self.processing_class.save_pretrained(output_dir)

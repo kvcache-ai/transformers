@@ -245,11 +245,6 @@ def is_kt_routed_expert_parameter_name(name: str) -> bool:
     return is_routed(name)
 
 
-def is_kt_int8_expert_loading_enabled() -> bool:
-    """Whether checkpoint expert tensors are replaced by pre-quantized KT INT8 weights."""
-    return _get_kt_expert_weight_format() == "int8" and is_kt_expert_loading_enabled()
-
-
 def is_kt_fp8_expert_loading_enabled() -> bool:
     """Whether checkpoint routed experts remain in native block-FP8 storage owned by KT."""
     return _get_kt_expert_weight_format() == "fp8" and is_kt_expert_loading_enabled()
@@ -277,8 +272,3 @@ def _validate_kt_prequantized_loading_info(loading_info: Any, model: Any | None 
     from kt_kernel.sft.artifacts import validate_kt_prequantized_loading_info
 
     validate_kt_prequantized_loading_info(_get_kt_config(), loading_info, model)
-
-
-def _validate_kt_int8_loading_info(loading_info: Any, model: Any | None = None) -> None:
-    """Backward-compatible alias for callers that still use the INT8-specific validator name."""
-    _validate_kt_prequantized_loading_info(loading_info, model)
