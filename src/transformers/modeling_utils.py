@@ -4041,6 +4041,24 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
 
+        from .integrations.kt_artifacts import resolve_kt_pretrained_artifacts
+
+        kt_load_plan = None
+        if pretrained_model_name_or_path is not None:
+            kt_load_plan = resolve_kt_pretrained_artifacts(
+                pretrained_model_name_or_path,
+                quantization_config,
+            )
+        if kt_load_plan is not None and (state_dict is not None or gguf_file is not None):
+            raise RuntimeError("KT non-expert cache loading cannot be combined with `state_dict` or `gguf_file`.")
+        if (
+            kt_load_plan is not None
+            and kt_load_plan.disable_source_quantizer
+            and hasattr(config, "quantization_config")
+        ):
+            # The plan points at validated non-expert weights in their target dtype, not the source model's quantizer.
+            delattr(config, "quantization_config")
+
         hf_quantizer, config, device_map = get_hf_quantizer(
             config, quantization_config, device_map, weights_only, user_agent
         )
@@ -4064,17 +4082,35 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             )
             use_kernels = True
 
-        checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(
-            pretrained_model_name_or_path=pretrained_model_name_or_path,
-            variant=variant,
-            gguf_file=gguf_file,
-            use_safetensors=use_safetensors,
-            download_kwargs=download_kwargs_with_commit,
-            user_agent=user_agent,
-            is_remote_code=cls.is_remote_code(),
-            transformers_explicit_filename=getattr(config, "transformers_weights", None),
-            tqdm_class=tqdm_class,
-        )
+        if kt_load_plan is None:
+            checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                variant=variant,
+                gguf_file=gguf_file,
+                use_safetensors=use_safetensors,
+                download_kwargs=download_kwargs_with_commit,
+                user_agent=user_agent,
+                is_remote_code=cls.is_remote_code(),
+                transformers_explicit_filename=getattr(config, "transformers_weights", None),
+                tqdm_class=tqdm_class,
+            )
+        else:
+            if variant is not None or use_safetensors is False:
+                raise RuntimeError("KT non-expert cache requires the default safetensors variant.")
+            checkpoint_files, sharded_metadata = _get_resolved_checkpoint_files(
+                pretrained_model_name_or_path=kt_load_plan.weight_path,
+                variant=None,
+                gguf_file=None,
+                use_safetensors=True,
+                download_kwargs={"local_files_only": True},
+                user_agent=user_agent,
+                is_remote_code=False,
+                tqdm_class=tqdm_class,
+            )
+            if set(checkpoint_files or ()) != set(kt_load_plan.checkpoint_files):
+                raise RuntimeError(
+                    "Resolved KT non-expert checkpoint shards do not match the validated cache manifest."
+                )
 
         is_quantized = hf_quantizer is not None
 
@@ -4123,6 +4159,18 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                     use_kernels=use_kernels,
                 )
 
+        from .integrations.kt import is_kt_expert_loading_enabled
+
+        if is_kt_expert_loading_enabled():
+            from .integrations.kt_artifacts import claim_kt_routed_expert_subtrees
+
+            claim_kt_routed_expert_subtrees(model)
+
+        if kt_load_plan is not None:
+            from .integrations.kt_artifacts import mark_kt_int8_routed_expert_base_parameters
+
+            mark_kt_int8_routed_expert_base_parameters(model, kt_load_plan)
+
         # Create the dtype_plan to potentially use the `keep_in_fp32` flags (this needs to be called on the already
         # instantiated model, as the flags can be modified by instances sometimes)
         dtype_plan = model._get_dtype_plan(dtype)
@@ -4156,18 +4204,30 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         )
         loading_info, disk_offload_index = cls._load_pretrained_model(model, state_dict, checkpoint_files, load_config)
         loading_info = cls._finalize_model_loading(model, load_config, loading_info)
+        if kt_load_plan is not None:
+            from .integrations.kt_artifacts import validate_kt_pretrained_load
+
+            validate_kt_pretrained_load(kt_load_plan, loading_info, model)
+        else:
+            from .integrations.kt import _validate_kt_prequantized_loading_info
+
+            _validate_kt_prequantized_loading_info(loading_info, model)
 
         # KT wrapping: if KT expert loading is enabled, wrap MoE layers with KT kernel
         # before eval() so the model is returned in KT-wrapped state.
-        from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
+        from .integrations.kt import _get_kt_config
+
         if is_kt_expert_loading_enabled():
             kt_config = _get_kt_config()
             if kt_config is not None:
-                if hasattr(kt_config, "_kt_config") and isinstance(kt_config._kt_config, dict):
-                    if checkpoint_files is not None:
-                        kt_config._kt_config.setdefault("kt_checkpoint_files", checkpoint_files)
-                    if sharded_metadata is not None:
-                        kt_config._kt_config.setdefault("kt_sharded_metadata", sharded_metadata)
+                set_runtime_metadata = getattr(kt_config, "set_runtime_metadata", None)
+                if set_runtime_metadata is not None:
+                    set_runtime_metadata(
+                        kt_checkpoint_files=checkpoint_files,
+                        kt_sharded_metadata=sharded_metadata,
+                        kt_pretrained_load_plan=kt_load_plan,
+                        kt_source_model_name_or_path=pretrained_model_name_or_path,
+                    )
 
                 from kt_kernel.sft import wrap_moe_layers_with_kt_wrapper
 
@@ -4295,17 +4355,23 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
             # KT: stash checkpoint_files on kt_config so from_pretrained's KT wrapper can access them,
             # and filter expert keys from the state dict — KT kernel loads them directly.
-            from .integrations.kt import _get_kt_config, is_kt_expert_loading_enabled
+            from .integrations.kt import (
+                _get_kt_config,
+                is_kt_expert_loading_enabled,
+                is_kt_routed_expert_parameter_name,
+            )
+
             if is_kt_expert_loading_enabled():
                 kt_config = _get_kt_config()
                 if kt_config is not None:
-                    try:
-                        if hasattr(kt_config, "_kt_config") and isinstance(kt_config._kt_config, dict):
-                            kt_config._kt_config.setdefault("kt_checkpoint_files", checkpoint_files)
-                    except Exception:
-                        pass
-                _kt_re = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)")
-                merged_state_dict = {k: v for k, v in merged_state_dict.items() if not _kt_re.search(k)}
+                    set_runtime_metadata = getattr(kt_config, "set_runtime_metadata", None)
+                    if set_runtime_metadata is not None:
+                        set_runtime_metadata(kt_checkpoint_files=checkpoint_files)
+                merged_state_dict = {
+                    key: value
+                    for key, value in merged_state_dict.items()
+                    if not is_kt_routed_expert_parameter_name(key)
+                }
 
             loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
                 model=model,
@@ -4328,15 +4394,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         """Perform all post processing operations after having loaded some checkpoints into a model, such as moving
         missing keys from meta device to their expected device, reinitializing missing weights according to proper
         distributions, tying the weights and logging the loading report."""
-        # KT: filter expert keys from missing_keys and replace meta params with CPU placeholders.
-        from .integrations.kt import is_kt_expert_loading_enabled
+        # KT owns routed-expert names; Transformers only preserves skipped tensors until wrapper replacement.
+        from .integrations.kt import is_kt_expert_loading_enabled, is_kt_routed_expert_parameter_name
+
         if is_kt_expert_loading_enabled():
-            _kt_re_legacy = re.compile(r"\.experts\.\d+\.")
-            _kt_re_fused = re.compile(r"\.experts\.(gate_up_proj|down_proj|gate_proj|up_proj)$")
-            expert_missing = {
-                k for k in loading_info.missing_keys
-                if _kt_re_legacy.search(k) or _kt_re_fused.search(k)
-            }
+            expert_missing = {k for k in loading_info.missing_keys if is_kt_routed_expert_parameter_name(k)}
             if expert_missing:
                 loading_info.missing_keys -= expert_missing
                 for key in expert_missing:
@@ -4352,10 +4414,13 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                     if param is not None and param.device == torch.device("meta"):
                         tiny_storage = torch.UntypedStorage(1, device="cpu")
                         fake_tensor = torch.tensor([], dtype=param.dtype, device="cpu").set_(
-                            tiny_storage, storage_offset=0, size=param.shape,
+                            tiny_storage,
+                            storage_offset=0,
+                            size=param.shape,
                             stride=[0] * len(param.shape),
                         )
-                        setattr(module, param_name, nn.Parameter(fake_tensor, requires_grad=False))
+                        placeholder = nn.Parameter(fake_tensor, requires_grad=False)
+                        setattr(module, param_name, placeholder)
                     module._is_hf_initialized = True
 
         try:
@@ -4600,11 +4665,11 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
 
         # In this case we need to move everything back
         if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
-            from .integrations.kt import is_kt_expert_loading_enabled
-            _kt_skip_zeros = is_kt_expert_loading_enabled()
-            _kt_expert_re = re.compile(r"\.experts\.(\d+\.|gate_up_proj|down_proj|gate_proj|up_proj)") if _kt_skip_zeros else None
+            from .integrations.kt import is_kt_expert_loading_enabled, is_kt_routed_expert_parameter_name
+
+            skip_kt_routed_experts = is_kt_expert_loading_enabled()
             for key, param in self.named_parameters():
-                if _kt_expert_re is not None and _kt_expert_re.search(key):
+                if skip_kt_routed_experts and is_kt_routed_expert_parameter_name(key):
                     continue
                 value = torch.zeros_like(param, device="cpu")
                 _load_parameter_into_model(self, key, value)
@@ -4836,6 +4901,14 @@ def get_total_byte_count(
     total_byte_count = defaultdict(lambda: 0)
     tied_param_names = model.all_tied_weights_keys.keys()
     tp_plan = model._tp_plan if torch.distributed.is_available() and torch.distributed.is_initialized() else []
+    from .integrations.kt import (
+        is_kt_expert_loading_enabled,
+        is_kt_routed_expert_parameter_name,
+        is_kt_supported_moe_model,
+    )
+    from .integrations.kt_artifacts import is_kt_int8_routed_expert_base_parameter
+
+    skip_kt_routed_experts = is_kt_expert_loading_enabled() and is_kt_supported_moe_model(model)
 
     for param_name, device in accelerator_device_map.items():
         # Skip if the parameter has already been accounted for (tied weights)
@@ -4844,6 +4917,10 @@ def get_total_byte_count(
 
         param = model.get_parameter_or_buffer(param_name)
 
+        if is_kt_int8_routed_expert_base_parameter(param) or (
+            skip_kt_routed_experts and is_kt_routed_expert_parameter_name(param_name)
+        ):
+            continue
         if hf_quantizer is not None:
             dtype_size = hf_quantizer.param_element_size(model, param_name, param)
         else:

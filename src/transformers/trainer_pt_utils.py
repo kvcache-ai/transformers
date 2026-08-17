@@ -1246,7 +1246,12 @@ class AcceleratorConfig:
         return cls(**config_dict)
 
     def to_dict(self):
-        return copy.deepcopy(self.__dict__)
+        payload = copy.deepcopy(self.__dict__)
+        if self.kt_config is not None:
+            from .integrations.kt import _serialize_kt_config
+
+            payload["kt_config"] = _serialize_kt_config(self.kt_config)
+        return payload
 
     def pop(self, key, default=None):
         return self.__dict__.pop(key, default)

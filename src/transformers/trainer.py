@@ -241,14 +241,17 @@ if is_accelerate_available():
 
     try:
         from kt_kernel.sft import (
-            get_kt_lora_params,
+            get_kt_named_trainable_params,
             kt_adapt_peft_lora,
-            load_kt_moe_from_adapter,
-            save_kt_moe_to_adapter,
             update_kt_lora_pointers,
         )
     except ImportError:
-        get_kt_lora_params = kt_adapt_peft_lora = load_kt_moe_from_adapter = save_kt_moe_to_adapter = update_kt_lora_pointers = None
+        get_kt_named_trainable_params = kt_adapt_peft_lora = update_kt_lora_pointers = None
+
+    try:
+        from kt_kernel.sft import get_kt_rank_local_parameter_names
+    except ImportError:
+        get_kt_rank_local_parameter_names = None
 
 
 if TYPE_CHECKING:
@@ -261,10 +264,112 @@ logger = logging.get_logger(__name__)
 TRAINING_ARGS_NAME = "training_args.bin"
 TRAINER_STATE_NAME = "trainer_state.json"
 OPTIMIZER_NAME = "optimizer.pt"
+KT_OPTIMIZER_INDEX_NAME = "kt_optimizer.index.json"
+KT_OPTIMIZER_INDEX_VERSION = 1
 SCALER_NAME = "scaler.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 FSDP_MODEL_NAME = "pytorch_model_fsdp"
+
+
+def _kt_optimizer_rank_files(world_size: int) -> list[str]:
+    return [f"optimizer_rank_{rank:05d}.pt" for rank in range(world_size)]
+
+
+def _atomic_path_save(save_function: Callable[[str], None], destination: str) -> None:
+    """Run a path-based writer without ever publishing a partial destination file."""
+    output_dir = os.path.dirname(destination)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        dir=output_dir,
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    try:
+        save_function(temporary_path)
+        os.replace(temporary_path, destination)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temporary_path)
+        raise
+
+
+def _atomic_torch_save(state_dict: dict[str, Any], destination: str) -> None:
+    """Atomically save a torch state dict."""
+    _atomic_path_save(partial(torch.save, state_dict), destination)
+
+
+def _atomic_json_save(payload: dict[str, Any], destination: str) -> None:
+    """Atomically publish a small JSON manifest."""
+    output_dir = os.path.dirname(destination)
+    os.makedirs(output_dir, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        dir=output_dir,
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temporary_path)
+        raise
+
+
+def _resolve_kt_artifact_path(path: str | os.PathLike) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _read_kt_optimizer_manifest(checkpoint: str, expected_world_size: int) -> list[str]:
+    manifest_path = os.path.join(checkpoint, KT_OPTIMIZER_INDEX_NAME)
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Could not read KT optimizer manifest {manifest_path}: {error}") from error
+
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"KT optimizer manifest {manifest_path} must contain a JSON object.")
+
+    version = manifest.get("version", KT_OPTIMIZER_INDEX_VERSION)
+    if version != KT_OPTIMIZER_INDEX_VERSION:
+        raise RuntimeError(
+            f"KT optimizer manifest {manifest_path} has unsupported version {version!r}; "
+            f"expected {KT_OPTIMIZER_INDEX_VERSION}."
+        )
+
+    world_size = manifest.get("world_size")
+    if not isinstance(world_size, int) or isinstance(world_size, bool):
+        raise RuntimeError(f"KT optimizer manifest {manifest_path} has a non-integer `world_size`.")
+    if world_size != expected_world_size:
+        raise RuntimeError(
+            f"KT optimizer checkpoint was saved with world_size={world_size}, but the current run uses "
+            f"world_size={expected_world_size}. Resume with the original world size."
+        )
+
+    rank_files = manifest.get("rank_files")
+    expected_rank_files = _kt_optimizer_rank_files(expected_world_size)
+    if rank_files != expected_rank_files:
+        raise RuntimeError(
+            f"KT optimizer manifest {manifest_path} must contain `rank_files` in global-rank order: "
+            f"{expected_rank_files!r}."
+        )
+
+    missing_rank_files = [
+        filename for filename in rank_files if not os.path.isfile(os.path.join(checkpoint, filename))
+    ]
+    if missing_rank_files:
+        raise RuntimeError(
+            f"KT optimizer checkpoint {checkpoint} is incomplete; missing rank files: {missing_rank_files!r}."
+        )
+    return rank_files
 
 
 @requires(
@@ -767,7 +872,9 @@ class Trainer:
             args["dynamo_plugin"] = dynamo_plugin
 
         # KT plugin: forward kt_config from AcceleratorConfig to Accelerator
-        kt_config_dict = self.args.accelerator_config.kt_config if hasattr(self.args.accelerator_config, "kt_config") else None
+        kt_config_dict = (
+            self.args.accelerator_config.kt_config if hasattr(self.args.accelerator_config, "kt_config") else None
+        )
         if kt_config_dict is not None:
             if not _accelerate_supports_kt_config:
                 raise ImportError(
@@ -779,11 +886,21 @@ class Trainer:
                     "KTransformersPlugin could not be imported from `accelerate`. Please upgrade to a version that includes it."
                 )
             if isinstance(kt_config_dict, dict):
-                args["kt_config"] = KTransformersPlugin(**kt_config_dict)
+                enabled = bool(kt_config_dict.get("enabled", True))
+                kernel_config = {key: value for key, value in kt_config_dict.items() if key != "enabled"}
+                args["kt_config"] = KTransformersPlugin(enabled=enabled, kt_config=kernel_config)
             elif isinstance(kt_config_dict, KTransformersPlugin):
                 args["kt_config"] = kt_config_dict
+            elif (
+                getattr(self.args, "hf_kt_config", None) is not None
+                and self.args.hf_kt_config.config is kt_config_dict
+            ):
+                args["kt_config"] = KTransformersPlugin(
+                    enabled=self.args.hf_kt_config.enabled,
+                    kt_config=kt_config_dict,
+                )
             else:
-                raise TypeError("`kt_config` must be a dict or KTransformersPlugin instance.")
+                raise TypeError("`kt_config` must be a dict, KTConfig, or KTransformersPlugin instance.")
 
         return args
 
@@ -858,7 +975,9 @@ class Trainer:
         # deepspeed and accelerate flags covering both trainer args and accelerate launcher
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
-        self.is_kt_enabled = _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
+        self.is_kt_enabled = (
+            _accelerate_supports_kt_config and getattr(self.accelerator.state, "kt_config", None) is not None
+        )
 
         # post accelerator creation setup
         if self.is_fsdp_enabled:
@@ -1196,18 +1315,25 @@ class Trainer:
         opt_model = self.model if model is None else model
 
         if self.optimizer is None:
-            decay_parameters = self.get_decay_parameter_names(opt_model)
+            decay_parameters = set(self.get_decay_parameter_names(opt_model))
+            trainable_named_parameters = [(n, p) for n, p in opt_model.named_parameters() if p.requires_grad]
+            registered_parameter_ids = {id(parameter) for _, parameter in trainable_named_parameters}
+            external_kt_parameter_names = []
+            for name, parameter in getattr(self, "_kt_optimizer_named_parameters", ()):
+                if id(parameter) in registered_parameter_ids:
+                    continue
+                trainable_named_parameters.append((name, parameter))
+                registered_parameter_ids.add(id(parameter))
+                external_kt_parameter_names.append(name)
+                # KT-owned optimizer tensors are matrix weights; apply the same decay policy as linear weights.
+                decay_parameters.add(name)
             optimizer_grouped_parameters = [
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
-                    ],
+                    "params": [p for n, p in trainable_named_parameters if n in decay_parameters],
                     "weight_decay": self.args.weight_decay,
                 },
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
-                    ],
+                    "params": [p for n, p in trainable_named_parameters if n not in decay_parameters],
                     "weight_decay": 0.0,
                 },
             ]
@@ -1216,6 +1342,21 @@ class Trainer:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
             else:
                 optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+
+            unsupported_parameter_owner = next(
+                (name for name in ("params", "model", "optimizer_dict") if name in optimizer_kwargs),
+                None,
+            )
+            if external_kt_parameter_names and (
+                is_optimizer_factory(optimizer_cls) or unsupported_parameter_owner is not None
+            ):
+                owner = "optimizer factory" if unsupported_parameter_owner is None else unsupported_parameter_owner
+                raise ValueError(
+                    f"The selected optimizer uses {owner!r} to own its parameters and cannot safely include "
+                    "KT-managed parameters outside the model tree. Use a standard Trainer optimizer or provide a "
+                    "fully constructed optimizer containing every KT parameter. Missing external parameters: "
+                    f"{external_kt_parameter_names}."
+                )
 
             # Check if this is a factory (for complex optimizers like Muon, Dion)
             # Factories are instantiated first, then called with (opt_model, **kwargs)
@@ -1538,7 +1679,7 @@ class Trainer:
         self._globalstep_last_logged = self.state.global_step
 
         if self.is_kt_enabled:
-            # Keep KT LoRA grad views alive (avoid set_to_none=True clearing them).
+            # KT releases authoritative grads before zeroing.
             self.optimizer.zero_grad(set_to_none=False)
         else:
             model.zero_grad()
@@ -1599,8 +1740,163 @@ class Trainer:
 
         return epochs_trained, steps_trained_in_current_epoch
 
+    def _load_kt_adapter_collectively(self, model: nn.Module, adapter_path: str, operation: str) -> None:
+        """Load KT-owned adapter state with identical failure and barrier behavior on every rank."""
+        from .integrations.kt_artifacts import load_kt_adapter_artifacts
+
+        local_error = None
+        try:
+            adapter_path = _resolve_kt_artifact_path(adapter_path)
+            load_kt_adapter_artifacts(model, adapter_path)
+        except Exception as error:
+            local_error = error
+        self._raise_if_kt_checkpoint_failed(local_error, operation)
+        self._kt_checkpoint_barrier()
+        logger.info(f"Loaded KT-owned adapter tensors from {adapter_path}")
+
+    def _prepare_kt_for_training(self, max_steps, train_dataloader, resume_from_checkpoint):
+        """Prepare KT training in model, adaptation, optimizer, scheduler, then resume order."""
+        if self.is_deepspeed_enabled or self.is_fsdp_xla_enabled or is_sagemaker_mp_enabled():
+            raise RuntimeError("KT staged optimizer creation currently supports Accelerate and PyTorch FSDP only.")
+        if kt_adapt_peft_lora is None or get_kt_named_trainable_params is None:
+            raise ImportError("KT training requires a kt-kernel build exposing the public SFT adaptation APIs.")
+        clip_grad_norm = getattr(self.accelerator, "clip_grad_norm_", None)
+        try:
+            clip_grad_norm_parameters = inspect.signature(clip_grad_norm).parameters
+        except (TypeError, ValueError):
+            clip_grad_norm_parameters = {}
+        if "rank_local_parameters" not in clip_grad_norm_parameters:
+            raise RuntimeError(
+                "KT training requires an Accelerate build whose `clip_grad_norm_` supports `rank_local_parameters`."
+            )
+
+        if self._created_lr_scheduler:
+            self.lr_scheduler = None
+            self._created_lr_scheduler = False
+
+        self._kt_rank_local_parameter_names = ()
+        self._kt_placeholder_names = ()
+        is_fsdp2 = self.is_fsdp_enabled and getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
+        if is_fsdp2:
+            if get_kt_rank_local_parameter_names is None:
+                raise ImportError(
+                    "KT FSDP2 training requires a kt-kernel build exposing `get_kt_rank_local_parameter_names`."
+                )
+            register_rank_local_parameters = getattr(
+                self.accelerator,
+                "register_fsdp2_rank_local_parameters",
+                None,
+            )
+            if register_rank_local_parameters is None:
+                raise RuntimeError(
+                    "KT FSDP2 training requires an Accelerate build exposing "
+                    "`Accelerator.register_fsdp2_rank_local_parameters`."
+                )
+            rank_local_parameter_names = tuple(get_kt_rank_local_parameter_names(self.model))
+            get_fsdp_ckpt_kwargs(rank_local_parameter_names)
+            register_rank_local_parameters(self.model, rank_local_parameter_names)
+            self._kt_rank_local_parameter_names = rank_local_parameter_names
+            self._kt_placeholder_names = rank_local_parameter_names
+
+        model = self._wrap_model(self.model_wrapped)
+        use_accelerator_prepare = model is self.model
+        if use_accelerator_prepare:
+            # PEFT's recursive policy is FSDP1-only; FSDP2 keeps its module policy.
+            if self.is_fsdp_enabled and not is_fsdp2 and _is_peft_model(self.model):
+                update_fsdp_plugin_peft(self.model, self.accelerator)
+            # FSDP2 staged preparation leaves the optimizer until KT has created its final trainable tensors.
+            model = self.accelerator.prepare(self.model)
+
+        self.model_wrapped = model
+        if self.is_fsdp_enabled:
+            self.model = self.model_wrapped = model
+            if hasattr(self.model, "generate"):
+                dist.fsdp.register_fsdp_forward_method(self.model, "generate")
+
+        pc = getattr(self.accelerator, "parallelism_config", None)
+        if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
+            train_dataloader = self.accelerator.deepspeed_ulysses_dl_adapter(train_dataloader, model)
+
+        # FSDP checkpoints restore standard PEFT tensors only after the final FSDP parameter objects exist.
+        if resume_from_checkpoint is not None and self.is_fsdp_enabled:
+            self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
+
+        kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
+        adaptation = kt_adapt_peft_lora(kt_model)
+        self._kt_optimizer_named_parameters = tuple(get_kt_named_trainable_params(kt_model))
+        self._kt_placeholder_names = tuple(getattr(adaptation, "placeholder_names", ()))
+        if is_fsdp2 and self._kt_placeholder_names != self._kt_rank_local_parameter_names:
+            raise RuntimeError(
+                "KT adaptation changed the FSDP2 rank-local base-parameter inventory after model preparation."
+            )
+        result_named_parameters = getattr(adaptation, "named_optimizer_parameters", None)
+        result_inventory = (
+            tuple((name, id(parameter)) for name, parameter in result_named_parameters)
+            if result_named_parameters is not None
+            else None
+        )
+        public_inventory = tuple((name, id(parameter)) for name, parameter in self._kt_optimizer_named_parameters)
+        if result_inventory is not None and result_inventory != public_inventory:
+            raise RuntimeError(
+                "KT adaptation returned an optimizer parameter inventory inconsistent with its public getter."
+            )
+        model_parameter_ids = {id(parameter) for parameter in model.parameters()}
+        rank_local_parameter_ids = set()
+        rank_local_parameters = []
+        for _, parameter in self._kt_optimizer_named_parameters:
+            parameter_id = id(parameter)
+            if parameter_id in model_parameter_ids or parameter_id in rank_local_parameter_ids:
+                continue
+            rank_local_parameter_ids.add(parameter_id)
+            rank_local_parameters.append(parameter)
+        self._kt_rank_local_optimizer_parameters = tuple(rank_local_parameters)
+
+        if resume_from_checkpoint is None:
+            if self.args.kt_adapter_name_or_path is not None:
+                self._load_kt_adapter_collectively(
+                    kt_model,
+                    self.args.kt_adapter_name_or_path,
+                    "fresh adapter load",
+                )
+        else:
+            self._load_kt_adapter_collectively(kt_model, resume_from_checkpoint, "resumed adapter load")
+
+        user_supplied_optimizer = self.optimizer is not None
+        if not user_supplied_optimizer:
+            self.create_optimizer(model)
+        optimizer_parameter_ids = {
+            id(parameter) for group in self.optimizer.param_groups for parameter in group["params"]
+        }
+        missing = [
+            name
+            for name, parameter in self._kt_optimizer_named_parameters
+            if id(parameter) not in optimizer_parameter_ids
+        ]
+        if missing:
+            if user_supplied_optimizer:
+                raise RuntimeError(
+                    "A user-supplied optimizer was created before KT adaptation and is missing parameters: "
+                    f"{missing}. Let Trainer create the optimizer after adaptation."
+                )
+            raise RuntimeError(f"Trainer's optimizer is missing KT parameters after staged adaptation: {missing}.")
+        self.optimizer = self.accelerator.prepare(self.optimizer)
+
+        # The optimizer's parameter groups are final before scheduler construction and state restoration.
+        self.create_scheduler(num_training_steps=max_steps)
+        if resume_from_checkpoint is not None:
+            self._load_optimizer_and_scheduler(resume_from_checkpoint)
+            self._load_scaler(resume_from_checkpoint)
+
+        for attr in ("model", "optimizer", "lr_scheduler"):
+            setattr(self.callback_handler, attr, getattr(self, attr))
+        self.callback_handler.train_dataloader = train_dataloader
+        return model, train_dataloader
+
     def _prepare_for_training(self, max_steps, train_dataloader, resume_from_checkpoint):
         """Wrap model, create optimizer and scheduler, and run accelerator.prepare. Returns (model, train_dataloader)."""
+        if self.is_kt_enabled:
+            return self._prepare_kt_for_training(max_steps, train_dataloader, resume_from_checkpoint)
+
         delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
 
         # Can't delay optimizer creation when using FSDP2: https://github.com/huggingface/accelerate/blob/3f636d626063ffcf9a337c7d3624d61b7d187d59/src/accelerate/accelerator.py#L1404
@@ -1678,27 +1974,6 @@ class Trainer:
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             train_dataloader = self.accelerator.deepspeed_ulysses_dl_adapter(train_dataloader, model)
 
-        # KT LoRA adaptation: MUST happen AFTER all prepare() calls.
-        # FSDP2's prepare does model.to(meta) + load_state_dict(assign=True) which
-        # creates new param objects and destroys any .grad views set earlier.
-        kt_model = None
-        if self.is_kt_enabled:
-            kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-
-        if kt_model is not None and kt_adapt_peft_lora is not None:
-            kt_adapt_peft_lora(kt_model)
-
-            # Inject fused expert LoRA params into existing optimizer's last param group
-            # (cannot use add_param_group — lr_scheduler is already created with fixed group count)
-            if self.optimizer is not None and get_kt_lora_params is not None:
-                kt_lora_params = get_kt_lora_params(kt_model)
-                if kt_lora_params:
-                    existing_ids = {id(p) for group in self.optimizer.param_groups for p in group["params"]}
-                    new_params = [p for p in kt_lora_params if id(p) not in existing_ids]
-                    if new_params:
-                        self.optimizer.param_groups[-1]["params"].extend(new_params)
-                        logger.info(f"Injected {len(new_params)} fused expert LoRA params into optimizer")
-
         # load checkpoint
         if resume_from_checkpoint is not None:
             if self.is_deepspeed_enabled:
@@ -1710,9 +1985,6 @@ class Trainer:
 
             self._load_optimizer_and_scheduler(resume_from_checkpoint)
             self._load_scaler(resume_from_checkpoint)
-
-            if kt_model is not None and load_kt_moe_from_adapter is not None:
-                load_kt_moe_from_adapter(kt_model, resume_from_checkpoint)
 
         # Update the references for the callback_handler
         for attr in ("model", "optimizer", "lr_scheduler"):
@@ -1842,7 +2114,7 @@ class Trainer:
                             self.lr_scheduler.step()
 
                     if self.is_kt_enabled:
-                        # Use optimizer.zero_grad() with set_to_none=False to keep KT LoRA grad views alive.
+                        # KT releases authoritative grads before zeroing.
                         self.optimizer.zero_grad(set_to_none=False)
                     else:
                         model.zero_grad()
@@ -2571,13 +2843,26 @@ class Trainer:
         """Clip gradients to max_grad_norm. Returns the pre-clip gradient norm."""
         if is_sagemaker_mp_enabled() and self.args.fp16:
             return self.optimizer.clip_master_grads(self.args.max_grad_norm)
+        if self.is_kt_enabled:
+            return self.accelerator.clip_grad_norm_(
+                model.parameters(),
+                self.args.max_grad_norm,
+                rank_local_parameters=getattr(self, "_kt_rank_local_optimizer_parameters", ()),
+            )
         return self.accelerator.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
 
     def _get_grad_norm(self, model, grad_norm=None):
         """Return the gradient norm as a Python float."""
         if grad_norm is None:
             # Compute norm without clipping (inf means no actual clipping happens)
-            grad_norm = self.accelerator.clip_grad_norm_(model.parameters(), float("inf"))
+            if self.is_kt_enabled:
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    model.parameters(),
+                    float("inf"),
+                    rank_local_parameters=getattr(self, "_kt_rank_local_optimizer_parameters", ()),
+                )
+            else:
+                grad_norm = self.accelerator.clip_grad_norm_(model.parameters(), float("inf"))
 
         if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
             if hasattr(grad_norm, "item"):
@@ -3145,26 +3430,45 @@ class Trainer:
             if os.path.exists(best_checkpoint_dir):
                 self.state.best_model_checkpoint = best_checkpoint_dir
 
+        is_kt_fsdp_distributed = self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1
+
         if not self.args.save_only_model:
             # Save optimizer and scheduler
             self._save_optimizer_and_scheduler(output_dir)
-            self._save_scaler(output_dir)
-            # Save RNG state
-            self._save_rng_state(output_dir)
+            if is_kt_fsdp_distributed:
+                self._run_kt_checkpoint_io("scaler save", partial(self._save_scaler, output_dir))
+                self._run_kt_checkpoint_io("RNG state save", partial(self._save_rng_state, output_dir))
+            else:
+                self._save_scaler(output_dir)
+                # Save RNG state
+                self._save_rng_state(output_dir)
 
         # Save the Trainer state
-        if self.args.should_save:
-            # Update `ExportableState` callbacks and `TrainerControl` state to where we are currently
-            for cb in [
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
-            ]:
-                cb_name = cb.__class__.__name__
-                cb_state = cb.state()
-                if isinstance(self.state.stateful_callbacks[cb_name], list):
-                    self.state.stateful_callbacks[cb_name].append(cb_state)
+        def save_trainer_state():
+            if self.args.should_save:
+                # Update `ExportableState` callbacks and `TrainerControl` state to where we are currently
+                for cb in [
+                    cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
+                ]:
+                    cb_name = cb.__class__.__name__
+                    cb_state = cb.state()
+                    if isinstance(self.state.stateful_callbacks[cb_name], list):
+                        self.state.stateful_callbacks[cb_name].append(cb_state)
+                    else:
+                        self.state.stateful_callbacks[cb_name] = cb_state
+                trainer_state_path = os.path.join(output_dir, TRAINER_STATE_NAME)
+                if is_kt_fsdp_distributed:
+                    _atomic_path_save(self.state.save_to_json, trainer_state_path)
                 else:
-                    self.state.stateful_callbacks[cb_name] = cb_state
-            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+                    self.state.save_to_json(trainer_state_path)
+
+        if is_kt_fsdp_distributed:
+            self._run_kt_checkpoint_io("trainer state save", save_trainer_state)
+            if not self.args.save_only_model:
+                # The manifest is the completion marker and must be published only after every checkpoint component.
+                self._publish_kt_fsdp_optimizer_manifest(output_dir)
+        else:
+            save_trainer_state()
 
         if self.args.push_to_hub:
             self._push_from_checkpoint(output_dir)
@@ -3264,9 +3568,137 @@ class Trainer:
         os.makedirs(output_dir, exist_ok=True)
 
         if self.args.world_size <= 1:
-            torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+            rng_state_path = os.path.join(output_dir, "rng_state.pth")
         else:
-            torch.save(rng_states, os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth"))
+            rng_state_path = os.path.join(output_dir, f"rng_state_{self.args.process_index}.pth")
+
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            _atomic_torch_save(rng_states, rng_state_path)
+        else:
+            torch.save(rng_states, rng_state_path)
+
+    def _kt_checkpoint_barrier(self) -> None:
+        if self.args.world_size <= 1:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError("KT distributed checkpointing requires an initialized torch.distributed process group.")
+        dist.barrier()
+
+    def _raise_if_kt_checkpoint_failed(self, local_error: Exception | None, operation: str) -> None:
+        """Make every rank fail instead of leaving peers blocked at a checkpoint barrier."""
+        if self.args.world_size <= 1:
+            if local_error is not None:
+                raise RuntimeError(f"KT checkpoint {operation} failed: {local_error}") from local_error
+            return
+
+        if not dist.is_available() or not dist.is_initialized():
+            if local_error is not None:
+                raise RuntimeError(f"KT checkpoint {operation} failed: {local_error}") from local_error
+            raise RuntimeError("KT distributed checkpointing requires an initialized torch.distributed process group.")
+
+        collective_device = self.args.device if dist.get_backend() == dist.Backend.NCCL else torch.device("cpu")
+        failure = torch.tensor(int(local_error is not None), dtype=torch.int32, device=collective_device)
+        dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+        if failure.item():
+            if local_error is not None:
+                raise RuntimeError(f"KT checkpoint {operation} failed on this rank: {local_error}") from local_error
+            raise RuntimeError(f"KT checkpoint {operation} failed on another rank.")
+
+    def _run_kt_checkpoint_io(self, operation: str, save_function: Callable[[], None]) -> None:
+        local_error = None
+        try:
+            save_function()
+        except Exception as error:
+            local_error = error
+        self._raise_if_kt_checkpoint_failed(local_error, operation)
+        self._kt_checkpoint_barrier()
+
+    def _save_kt_fsdp_optimizer(self, output_dir: str) -> None:
+        world_size = self.args.world_size
+        rank = self.args.process_index
+        rank_files = _kt_optimizer_rank_files(world_size)
+        rank_path = os.path.join(output_dir, rank_files[rank])
+
+        # Fixed per-rank filenames are overwritten on a retry. Remove the old publication marker first so an
+        # interrupted retry can never make a stale manifest advertise a mixture of old and new rank files.
+        manifest_invalidation_error = None
+        if rank == 0:
+            try:
+                os.remove(os.path.join(output_dir, KT_OPTIMIZER_INDEX_NAME))
+            except FileNotFoundError:
+                pass
+            except Exception as error:
+                manifest_invalidation_error = error
+        self._raise_if_kt_checkpoint_failed(manifest_invalidation_error, "old optimizer manifest invalidation")
+        self._kt_checkpoint_barrier()
+
+        rank_save_error = None
+        try:
+            _atomic_torch_save(self.optimizer.state_dict(), rank_path)
+        except Exception as error:
+            rank_save_error = error
+        self._raise_if_kt_checkpoint_failed(rank_save_error, f"optimizer save for rank {rank}")
+        self._kt_checkpoint_barrier()
+
+    def _save_kt_fsdp_scheduler(self, output_dir: str) -> None:
+        def save_scheduler():
+            if self.args.process_index == 0:
+                _atomic_torch_save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+
+        self._run_kt_checkpoint_io("scheduler save", save_scheduler)
+
+    def _publish_kt_fsdp_optimizer_manifest(self, output_dir: str) -> None:
+        world_size = self.args.world_size
+        rank_files = _kt_optimizer_rank_files(world_size)
+        manifest_error = None
+        if self.args.process_index == 0:
+            manifest = {
+                "version": KT_OPTIMIZER_INDEX_VERSION,
+                "world_size": world_size,
+                "rank_files": rank_files,
+            }
+            try:
+                missing_rank_files = [
+                    filename for filename in rank_files if not os.path.isfile(os.path.join(output_dir, filename))
+                ]
+                if missing_rank_files:
+                    raise RuntimeError(f"missing optimizer rank files: {missing_rank_files!r}")
+                _atomic_json_save(manifest, os.path.join(output_dir, KT_OPTIMIZER_INDEX_NAME))
+            except Exception as error:
+                manifest_error = error
+        self._raise_if_kt_checkpoint_failed(manifest_error, "optimizer manifest publication")
+        self._kt_checkpoint_barrier()
+
+    def _resolve_kt_fsdp_optimizer(self, checkpoint: str) -> str | None:
+        manifest_path = os.path.join(checkpoint, KT_OPTIMIZER_INDEX_NAME)
+        rank_files_on_disk = glob.glob(os.path.join(checkpoint, "optimizer_rank_*.pt"))
+
+        if os.path.isfile(manifest_path):
+            rank_files = _read_kt_optimizer_manifest(checkpoint, self.args.world_size)
+            rank = self.args.process_index
+            if rank < 0 or rank >= len(rank_files):
+                raise RuntimeError(
+                    f"Current process index {rank} is outside the KT optimizer manifest's rank range "
+                    f"[0, {len(rank_files)})."
+                )
+            return os.path.join(checkpoint, rank_files[rank])
+
+        if rank_files_on_disk:
+            raise RuntimeError(
+                f"KT optimizer checkpoint {checkpoint} has per-rank optimizer files but no "
+                f"{KT_OPTIMIZER_INDEX_NAME}; the save did not complete and cannot be resumed safely."
+            )
+
+        legacy_optimizer_exists = os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME)) or os.path.isfile(
+            os.path.join(checkpoint, OPTIMIZER_NAME_BIN)
+        )
+        if legacy_optimizer_exists:
+            raise RuntimeError(
+                "This is a legacy multi-rank KT/FSDP checkpoint with one shared optimizer file. It cannot be resumed "
+                "safely because each rank has a different optimizer parameter layout. Resume from a checkpoint "
+                f"containing {KT_OPTIMIZER_INDEX_NAME}, or restart training from the saved model weights."
+            )
+        return None
 
     def _save_optimizer_and_scheduler(self, output_dir: str) -> None:
         """Save optimizer and learning rate scheduler states to `output_dir`."""
@@ -3312,13 +3744,19 @@ class Trainer:
         elif self.is_fsdp_enabled:
             # save fsdp specific ckpt for resuming from ckpt
             save_fsdp_model(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **get_fsdp_ckpt_kwargs()
+                self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                self.model,
+                output_dir,
+                **get_fsdp_ckpt_kwargs(getattr(self, "_kt_placeholder_names", ())),
             )
-            # When KT is enabled, KT LoRA params are not managed by FSDP, so we can't use
-            # save_fsdp_optimizer (it fails to map KT LoRA params). Use regular torch.save instead.
+            # KT params are not managed by FSDP, so save each rank's optimizer state separately. Optimizer parameter
+            # groups differ by rank, and a shared rank-0 state dict cannot be loaded safely on the other ranks.
             if self.is_kt_enabled:
-                if self.args.should_save:
-                    torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+                if self.args.world_size > 1:
+                    self._save_kt_fsdp_optimizer(output_dir)
+                elif self.args.should_save:
+                    _atomic_torch_save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
             else:
                 save_fsdp_optimizer(
                     self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
@@ -3331,7 +3769,9 @@ class Trainer:
         is_deepspeed_custom_scheduler = self.is_deepspeed_enabled and not isinstance(
             self.lr_scheduler, DeepSpeedSchedulerWrapper
         )
-        if (
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            self._save_kt_fsdp_scheduler(output_dir)
+        elif (
             self.args.should_save
             and (not self.is_deepspeed_enabled or is_deepspeed_custom_scheduler)
             and not is_torch_xla_available()
@@ -3358,7 +3798,12 @@ class Trainer:
         # Save SCALER
         if self.args.should_save and not is_torch_xla_available():
             with warnings.catch_warnings(record=True) as caught_warnings:
-                torch.save(self.accelerator.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+                scaler_state = self.accelerator.scaler.state_dict()
+                scaler_path = os.path.join(output_dir, SCALER_NAME)
+                if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+                    _atomic_torch_save(scaler_state, scaler_path)
+                else:
+                    torch.save(scaler_state, scaler_path)
             reissue_pt_warnings(caught_warnings)
 
     # ---- Checkpoint Resuming ----
@@ -3444,7 +3889,7 @@ class Trainer:
                     self.accelerator,
                     model,
                     resume_from_checkpoint,
-                    **get_fsdp_ckpt_kwargs(),
+                    **get_fsdp_ckpt_kwargs(getattr(self, "_kt_placeholder_names", ())),
                 )
             else:
                 # We load the model state dict on the CPU to avoid an OOM error.
@@ -3513,7 +3958,7 @@ class Trainer:
                 self.accelerator,
                 model,
                 self.state.best_model_checkpoint,
-                **get_fsdp_ckpt_kwargs(),
+                **get_fsdp_ckpt_kwargs(getattr(self, "_kt_placeholder_names", ())),
             )
         elif (
             os.path.exists(best_model_path)
@@ -3598,6 +4043,14 @@ class Trainer:
                 "on multiple nodes, you should activate `--save_on_each_node`."
             )
 
+        if self.is_kt_enabled:
+            kt_model = self.accelerator.unwrap_model(model, keep_torch_compile=False)
+            self._load_kt_adapter_collectively(
+                kt_model,
+                self.state.best_model_checkpoint,
+                "best adapter load",
+            )
+
     def _load_rng_state(self, checkpoint: str | None) -> None:
         """Restore random number generator states from a checkpoint."""
         # Load RNG states from `checkpoint`
@@ -3659,27 +4112,38 @@ class Trainer:
                 reissue_pt_warnings(caught_warnings)
             return
 
-        checkpoint_file_exists = (
-            glob.glob(os.path.join(checkpoint, OPTIMIZER_NAME) + "_*")
-            if is_sagemaker_mp_enabled()
-            else (
-                os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME))
-                or os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME_BIN))
-                or (
-                    os.path.isdir(checkpoint)
-                    and any(
-                        OPTIMIZER_NAME_BIN.split(".")[0] in folder_name
-                        for folder_name in os.listdir(checkpoint)
-                        if os.path.isdir(os.path.join(checkpoint, folder_name))
+        kt_fsdp_optimizer_path = None
+        if self.is_fsdp_enabled and self.is_kt_enabled and self.args.world_size > 1:
+            kt_fsdp_optimizer_path = self._resolve_kt_fsdp_optimizer(checkpoint)
+            checkpoint_file_exists = kt_fsdp_optimizer_path is not None
+        else:
+            checkpoint_file_exists = (
+                glob.glob(os.path.join(checkpoint, OPTIMIZER_NAME) + "_*")
+                if is_sagemaker_mp_enabled()
+                else (
+                    os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME))
+                    or os.path.isfile(os.path.join(checkpoint, OPTIMIZER_NAME_BIN))
+                    or (
+                        os.path.isdir(checkpoint)
+                        and any(
+                            OPTIMIZER_NAME_BIN.split(".")[0] in folder_name
+                            for folder_name in os.listdir(checkpoint)
+                            if os.path.isdir(os.path.join(checkpoint, folder_name))
+                        )
                     )
                 )
             )
-        )
-        checkpoint_file_exists = (
-            glob.glob(os.path.join(checkpoint, f"rank*-of-{self.args.world_size}-{OPTIMIZER_NAME}"))
-            if self.is_fsdp_xla_v1_enabled
-            else checkpoint_file_exists
-        )
+            checkpoint_file_exists = (
+                glob.glob(os.path.join(checkpoint, f"rank*-of-{self.args.world_size}-{OPTIMIZER_NAME}"))
+                if self.is_fsdp_xla_v1_enabled
+                else checkpoint_file_exists
+            )
+
+        if kt_fsdp_optimizer_path is not None and not os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
+            raise RuntimeError(
+                f"KT optimizer checkpoint {checkpoint} is missing {SCHEDULER_NAME} and cannot be resumed safely."
+            )
+
         if checkpoint_file_exists and os.path.isfile(os.path.join(checkpoint, SCHEDULER_NAME)):
             # Load in optimizer and scheduler states
             if is_torch_xla_available():
@@ -3732,6 +4196,11 @@ class Trainer:
                             self.model,
                             checkpoint,
                             **get_fsdp_ckpt_kwargs(),
+                        )
+                    elif kt_fsdp_optimizer_path is not None:
+                        check_torch_load_is_safe()
+                        self.optimizer.load_state_dict(
+                            torch.load(kt_fsdp_optimizer_path, map_location="cpu", weights_only=True)
                         )
                     else:
                         check_torch_load_is_safe()
@@ -3851,7 +4320,22 @@ class Trainer:
                 self._save(output_dir, state_dict=state_dict)
             Path(os.path.join(output_dir, "user_content.pt")).touch()
         elif self.is_fsdp_enabled:
-            if "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
+            is_fsdp2 = getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2
+            if self.is_kt_enabled and is_fsdp2 and _is_peft_model(self.model):
+                state_dict = self.accelerator.get_state_dict(
+                    self.model,
+                    adapter_only=True,
+                    excluded_parameter_names=getattr(self, "_kt_placeholder_names", ()),
+                )
+                save_error = None
+                if self.args.should_save:
+                    try:
+                        self._save(output_dir, state_dict=state_dict)
+                    except Exception as error:
+                        save_error = error
+                self._raise_if_kt_checkpoint_failed(save_error, "adapter model save")
+                self._kt_checkpoint_barrier()
+            elif "FULL_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type):
                 state_dict = self.accelerator.get_state_dict(self.model)
                 if self.args.should_save:
                     self._save(output_dir, state_dict=state_dict)
@@ -3885,7 +4369,11 @@ class Trainer:
 
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
-            self.push_to_hub(commit_message="Model save", revision=self.args.hub_revision)
+            self.push_to_hub(
+                commit_message="Model save",
+                revision=self.args.hub_revision,
+                _model_is_saved=True,
+            )
 
     def _save(self, output_dir: str | None = None, state_dict: dict | None = None) -> None:
         """Save model weights, configuration, and processing class to `output_dir`."""
@@ -3926,9 +4414,11 @@ class Trainer:
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
-        if self.is_kt_enabled and save_kt_moe_to_adapter is not None and self.args.should_save:
+        if self.is_kt_enabled and self.args.should_save:
             kt_model = self.accelerator.unwrap_model(self.model, keep_torch_compile=False)
-            save_kt_moe_to_adapter(kt_model, output_dir)
+            from .integrations.kt_artifacts import save_kt_adapter_artifacts
+
+            save_kt_adapter_artifacts(kt_model, output_dir)
 
     # ---- Logging & Metrics ----
 
@@ -4109,6 +4599,8 @@ class Trainer:
         """
         self.callback_handler.on_push_begin(self.args, self.state, self.control)
 
+        model_is_saved = kwargs.pop("_model_is_saved", False)
+
         model_name = kwargs.pop("model_name", None)
         if model_name is None and self.args.should_save:
             if self.args.hub_model_id is None:
@@ -4123,7 +4615,8 @@ class Trainer:
 
         # Needs to be executed on all processes for TPU training, but will only save on the processed determined by
         # self.args.should_save.
-        self.save_model(_internal_call=True)
+        if not model_is_saved:
+            self.save_model(_internal_call=True)
 
         # Only push from one node.
         if not self.is_world_process_zero():
