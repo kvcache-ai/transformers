@@ -71,7 +71,7 @@ if stale_egg_info.exists():
 # 2. once modified, run: `make fix-repo` to update src/transformers/dependency_versions_table.py
 _deps = [
     "Pillow>=10.0.1,<=15.0",
-    "accelerate-kt>=1.14.0",
+    "accelerate-kt>=1.14.0.post2",
     "av",
     "beautifulsoup4",
     "blobfile",
@@ -325,7 +325,7 @@ if __name__ == "__main__":
 
     setup(
         name="transformers-kt",
-        version="5.6.0.post1",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
+        version="5.6.0.post2",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
         author="The Hugging Face team (past and future) with the help of all our contributors (https://github.com/huggingface/transformers/graphs/contributors)",
         author_email="transformers@huggingface.co",
         description="Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training.",
