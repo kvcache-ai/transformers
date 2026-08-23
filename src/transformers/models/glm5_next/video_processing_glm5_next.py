@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 from ...processing_utils import VideosKwargs
-from ...video_utils import VideoMetadata
+from ...video_utils import VideoMetadata, load_video
 from ..glm46v.video_processing_glm46v import Glm46VVideoProcessor
 
 
@@ -174,6 +174,19 @@ class Glm5NextVideoProcessor(Glm46VVideoProcessor):
                 [unique_indices[-1]] * (self.temporal_patch_size - len(unique_indices) % self.temporal_patch_size)
             )
         return np.asarray(unique_indices, dtype=np.int64)
+
+    def fetch_videos(self, video_url_or_urls, sample_indices_fn=None):
+        """Decode seekable GLM videos with PyAV for deterministic H.264 support."""
+
+        if isinstance(video_url_or_urls, list):
+            return list(
+                zip(*[self.fetch_videos(video, sample_indices_fn=sample_indices_fn) for video in video_url_or_urls])
+            )
+        return load_video(
+            video_url_or_urls,
+            backend="pyav",
+            sample_indices_fn=sample_indices_fn,
+        )
 
 
 __all__ = ["Glm5NextVideoProcessor"]
