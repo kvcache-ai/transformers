@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -103,6 +104,23 @@ class Glm5NextProcessorTest(unittest.TestCase):
         self.assertTrue(np.all(indices[1:] > indices[:-1]))
         self.assertGreaterEqual(indices[0], 0)
         self.assertLess(indices[-1], metadata.total_num_frames)
+
+    def test_video_paths_use_pyav(self):
+        processor = Glm5NextVideoProcessor(**OFFICIAL_VIDEO_CONFIG)
+        metadata = VideoMetadata(total_num_frames=2, fps=2, duration=1, frames_indices=[0, 1])
+        decoded = np.zeros((2, 56, 56, 3), dtype=np.uint8)
+        with patch(
+            "transformers.models.glm5_next.video_processing_glm5_next.load_video",
+            return_value=(decoded, metadata),
+        ) as load:
+            actual = processor.fetch_videos("/tmp/video.mp4", sample_indices_fn=processor.sample_frames)
+        self.assertIs(actual[0], decoded)
+        self.assertIs(actual[1], metadata)
+        load.assert_called_once_with(
+            "/tmp/video.mp4",
+            backend="pyav",
+            sample_indices_fn=processor.sample_frames,
+        )
 
     def test_invalid_processor_metadata_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "patch_expand_factor=1"):
