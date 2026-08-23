@@ -18,7 +18,7 @@ from ...image_processing_utils import BatchFeature
 from ...image_transforms import group_images_by_shape, reorder_images
 from ...image_utils import ImageInput, PILImageResampling, SizeDict
 from ...processing_utils import ImagesKwargs, Unpack
-from ...utils import TensorType, auto_docstring
+from ...utils import TensorType
 from ..glm46v.image_processing_glm46v import Glm46VImageProcessor, smart_resize
 
 
@@ -31,7 +31,6 @@ class Glm5NextImageProcessorKwargs(ImagesKwargs, total=False):
     max_image_tokens: int
 
 
-@auto_docstring
 class Glm5NextImageProcessor(Glm46VImageProcessor):
     """GLM-5-Next image processor using the checkpoint's factor-1 patch layout."""
 
@@ -87,7 +86,6 @@ class Glm5NextImageProcessor(Glm46VImageProcessor):
         if max_image_tokens < min_image_tokens:
             raise ValueError("max_image_tokens must be greater than or equal to min_image_tokens.")
 
-    @auto_docstring
     def preprocess(self, images: ImageInput, **kwargs: Unpack[Glm5NextImageProcessorKwargs]) -> BatchFeature:
         return super().preprocess(images, **kwargs)
 
