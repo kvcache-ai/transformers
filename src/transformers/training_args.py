@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import timedelta
 from enum import Enum
 from functools import cached_property
-from typing import Any
+from typing import Any, Literal
 
 from .debug_utils import DebugOption
 from .trainer_utils import (
@@ -391,12 +391,23 @@ class TrainingArguments:
             [swanlab](https://swanlab.cn) logging.
         project (`str`, *optional*, defaults to `"huggingface"`):
             The name of the project to use for logging. Currently, only used by Trackio.
-        trackio_space_id (`str` or `None`, *optional*, defaults to `"trackio"`):
-            The Hugging Face Space ID to deploy to when using Trackio. Should be a complete Space name like
-            `'username/reponame'` or `'orgname/reponame'`, or just `'reponame'` in which case the Space will be
-            created in the currently-logged-in Hugging Face user's namespace. If `None`, will log to a local directory.
-            Note that this Space will be public unless you set `hub_private_repo=True` or your organization's default
-            is to create private Spaces."
+        trackio_space_id (`str` or `None`, *optional*, defaults to `None`):
+            The Hugging Face Space ID to use for live Trackio logging with a Gradio-based Space. Should be a full
+            Space name like `'username/reponame'` or `'orgname/reponame'`, or just `'reponame'` (the Space is created in
+            the currently logged-in user's namespace). If `None`, metrics are logged only to a **local** directory (no
+            Space on the Hub). That Gradio Space has **read and write** access to the Trackio **Bucket**, which is what you want while
+            training is **in progress**—for example when **resuming** a partial run or **aggregating logs** from multiple
+            machines. The Space will be **public** unless you set `hub_private_repo=True` or your organization's default is to
+            create private Spaces.
+        trackio_bucket_id (`str` or `None`, *optional*, defaults to `None`):
+            Optional Hugging Face Bucket id for Trackio. If unset, Trackio derives one. Used together with a Gradio Space
+            (`trackio_space_id`) and when deploying a static Space (`trackio_static_space_id` is not `False`).
+        trackio_static_space_id (`str`, `False`, or `None`, *optional*, defaults to `None`):
+            The Hugging Face Space ID to use for static Space created after training is complete. Should be a full
+            Space name like `'username/reponame'` or `'orgname/reponame'`, or just `'reponame'` (the Space is created in
+            the currently logged-in user's namespace). If False, no static Space will be created. If None, and model is pushed to the Hub,
+            a static Space will be created with a default name and this will be linked from the model card. The Space will be public
+            unless you set `hub_private_repo=True` or your organization's default is to create private Spaces.
 
         > Evaluation
 
@@ -754,6 +765,7 @@ class TrainingArguments:
         "accelerator_config",
         "fsdp_config",
         "deepspeed",
+        "kt_config",
         "gradient_checkpointing_kwargs",
         "lr_scheduler_kwargs",
     ]
@@ -1045,13 +1057,29 @@ class TrainingArguments:
         metadata={"help": "The name of the project to use for logging. Currently, only used by Trackio."},
     )
     trackio_space_id: str | None = field(
-        default="trackio",
+        default=None,
         metadata={
-            "help": "The Hugging Face Space ID to deploy to when using Trackio. Should be a complete Space name like "
-            "'username/reponame' or 'orgname/reponame', or just 'reponame' in which case the Space will be created in "
-            "the currently-logged-in Hugging Face user's namespace. If `None`, will log to a local directory. Note "
-            "that this Space will be public unless you set `hub_private_repo=True` or your organization's "
-            "default is to create private Spaces."
+            "help": (
+                "Hugging Face Space id for live Gradio-based Trackio logging (read/write Bucket access). Use "
+                "'username/reponame', 'orgname/reponame', or 'reponame' (current user's namespace). None: log only "
+                "locally, no Space. Prefer trackio_static_space_id for stable post-training dashboard links. Public "
+                "unless hub_private_repo=True or org default."
+            )
+        },
+    )
+    trackio_bucket_id: str | None = field(
+        default=None,
+        metadata={"help": "Optional HF Bucket id when using a Trackio Space; if unset, Trackio picks a default."},
+    )
+    trackio_static_space_id: str | None | Literal[False] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Static read-only Trackio Space over the Bucket (stable model-card links). False: no static sync on Hub "
+                "push and no freeze after training. None/str: allow static Space; for local-only logging, Hub push runs "
+                "sync(static); after training, freeze runs only if trackio_space_id was set (Gradio Space). str sets "
+                "explicit static Space id. Public unless hub_private_repo=True or org default."
+            )
         },
     )
 
@@ -1179,8 +1207,8 @@ class TrainingArguments:
         metadata={
             "help": "Whether to make the repo private. If `None` (default), the repo will be public unless the "
             "organization's default is private. This value is ignored if the repo already exists. If reporting to "
-            "Trackio with deployment to Hugging Face Spaces enabled, the same logic determines whether the Space is "
-            "private."
+            "Trackio Spaces created or synced (including on Hub push when `trackio_space_id` is None) use the same "
+            "logic for whether the Space is private."
         },
     )
     hub_model_id: str | None = field(
@@ -1382,6 +1410,22 @@ class TrainingArguments:
     deepspeed: dict | str | None = field(
         default=None,
         metadata={"help": "Enable DeepSpeed integration. Value is a path to a JSON config file or a dict."},
+    )
+
+    # --- KTransformers ---
+    kt_config: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable KTransformers and pass a KT config dict or path to a json config file. "
+                "KTransformers accelerates MoE models using CPU AMX instructions."
+            )
+        },
+    )
+    kt_adapter_name_or_path: str | None = field(
+        default=None,
+        init=False,
+        metadata={"help": "Optional adapter directory containing KT-owned fused expert LoRA tensors."},
     )
 
     # --- Debugging ---
@@ -1637,6 +1681,57 @@ class TrainingArguments:
             self.deepspeed_plugin.set_mixed_precision(self.mixed_precision)
             self.deepspeed_plugin.set_deepspeed_weakref()
 
+        # ── 13. KTransformers ──
+        # Priority: self.kt_config > accelerator_config.kt_config > ACCELERATE_USE_KT env var.
+        kt_config = self.kt_config
+        if kt_config is None and is_accelerate_available() and self.accelerator_config is not None:
+            kt_config = getattr(self.accelerator_config, "kt_config", None)
+
+        from .integrations.kt import _is_kt_config_environment_owned, unset_kt_config
+
+        environment_requests_kt = strtobool(os.environ.get("ACCELERATE_USE_KT", "false"))
+        if kt_config is not None:
+            self.update_kt_config(kt_config)
+        elif environment_requests_kt and not _is_kt_config_environment_owned():
+            self.update_kt_config(None)
+        else:
+            # A new ordinary arguments object supersedes Transformers' previous process-global KT mirror.
+            unset_kt_config()
+
+    def update_kt_config(
+        self,
+        config: Any,
+        *,
+        adapter_name_or_path: str | os.PathLike | None = None,
+    ):
+        """Atomically configure KTransformers for model loading and training.
+
+        The input mapping is never mutated. Its normalized copy, or the original typed KTConfig, is shared by
+        `kt_config`, `hf_kt_config`, and `AcceleratorConfig`, so callers do not need to write Transformers private
+        attributes.
+        """
+        if not is_accelerate_available():
+            raise ValueError(
+                f"Using `kt_config` requires Accelerate to be installed: `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'."
+            )
+
+        if adapter_name_or_path is not None and not isinstance(adapter_name_or_path, (str, os.PathLike)):
+            raise TypeError(
+                f"`adapter_name_or_path` must be a path or None, got {type(adapter_name_or_path).__name__}."
+            )
+        normalized_adapter_path = os.fspath(adapter_name_or_path) if adapter_name_or_path is not None else None
+
+        from .integrations.kt import configure_kt
+
+        hf_kt_config = configure_kt(config)
+        # Commit all public views only after normalization and validation have succeeded.
+        self.kt_config = hf_kt_config.config
+        self.hf_kt_config = hf_kt_config
+        self.kt_adapter_name_or_path = normalized_adapter_path
+        if self.accelerator_config is not None:
+            self.accelerator_config.kt_config = hf_kt_config.config
+        return self
+
     def _validate_args(self):
         """Validate argument combinations and value constraints."""
         if self.torch_empty_cache_steps is not None:
@@ -1764,7 +1859,7 @@ class TrainingArguments:
             if not is_accelerate_available():
                 raise ImportError(
                     f"Using the `Trainer` with `PyTorch` requires `accelerate>={ACCELERATE_MIN_VERSION}`: "
-                    f"Please run `pip install transformers[torch]` or `pip install 'accelerate>={ACCELERATE_MIN_VERSION}'`"
+                    f"Please run `pip install transformers[torch]` or `pip install 'accelerate-kt>={ACCELERATE_MIN_VERSION}'`"
                 )
         # Build kwargs for PartialState; actual init happens below
         accelerator_state_kwargs: dict[str, Any] = {"enabled": True, "use_configured_state": False}
@@ -2095,6 +2190,10 @@ class TrainingArguments:
         d = {field.name: getattr(self, field.name) for field in fields(self) if field.init}
 
         for k, v in d.items():
+            if k == "kt_config" and v is not None:
+                from .integrations.kt import _serialize_kt_config
+
+                d[k] = _serialize_kt_config(v)
             if isinstance(v, Enum):
                 d[k] = v.value
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], Enum):

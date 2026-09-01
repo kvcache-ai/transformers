@@ -889,19 +889,26 @@ class Fp8Dequantize(ConversionOps):
             block_size = (quantized.shape[-2], quantized.shape[-1])
 
         block_m, block_n = block_size
-
-        if rows % block_m != 0 or cols % block_n != 0:
+        row_tiles = (rows + block_m - 1) // block_m
+        col_tiles = (cols + block_n - 1) // block_n
+        leading_size = quantized.numel() // (rows * cols)
+        expected_scale_elements = leading_size * row_tiles * col_tiles
+        if scales.numel() != expected_scale_elements:
             raise ValueError(
-                f"Matrix dimensions ({rows}, {cols}) must be divisible by block sizes ({block_m}, {block_n})."
+                f"Expected {expected_scale_elements} FP8 scales for matrix dimensions ({rows}, {cols}) "
+                f"and block sizes ({block_m}, {block_n}), but found {scales.numel()}."
             )
+
         quantized = quantized.to(scales.dtype)
-        reshaped = quantized.reshape(-1, rows // block_m, block_m, cols // block_n, block_n)
-        expanded_scales = scales.reshape(-1, rows // block_m, cols // block_n)
+        padded_rows, padded_cols = row_tiles * block_m, col_tiles * block_n
+        quantized = F.pad(quantized, (0, padded_cols - cols, 0, padded_rows - rows))
+        reshaped = quantized.reshape(-1, row_tiles, block_m, col_tiles, block_n)
+        expanded_scales = scales.reshape(-1, row_tiles, col_tiles)
         expanded_scales = expanded_scales.unsqueeze(-1).unsqueeze(2)
         dequantized = reshaped * expanded_scales
 
         return {
-            full_layer_name: dequantized.reshape(quantized.shape),
+            full_layer_name: dequantized.reshape(*quantized.shape[:-2], padded_rows, padded_cols)[..., :rows, :cols],
         }
 
     @property

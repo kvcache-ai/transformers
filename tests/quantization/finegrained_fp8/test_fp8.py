@@ -32,10 +32,52 @@ from transformers.testing_utils import (
     torch_device,
 )
 from transformers.utils import is_torch_available
+from transformers.utils.import_utils import is_triton_available
 
 
 if is_torch_available():
     import torch
+
+
+@unittest.skipUnless(is_triton_available(), "Fine-grained FP8 conversion tests require Triton.")
+class FP8DequantizeTest(unittest.TestCase):
+    @staticmethod
+    def _dequantize(weight, scales, block_size=(2, 3)):
+        from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+
+        quantizer = type(
+            "FineGrainedFP8HfQuantizer",
+            (),
+            {"quantization_config": FineGrainedFP8Config(weight_block_size=block_size)},
+        )()
+        return Fp8Dequantize(quantizer).convert(
+            {"weight$": [weight], "weight_scale_inv": [scales]}, full_layer_name="weight"
+        )["weight"]
+
+    def test_dequantizes_complete_blocks(self):
+        weight = torch.ones((4, 6), dtype=torch.float8_e4m3fn)
+        scales = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+        actual = self._dequantize(weight, scales)
+        expected = scales.repeat_interleave(2, dim=0).repeat_interleave(3, dim=1)
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_dequantizes_partial_edge_blocks(self):
+        weight = torch.ones((3, 5), dtype=torch.float8_e4m3fn)
+        scales = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+        actual = self._dequantize(weight, scales)
+        expected = scales.repeat_interleave(2, dim=0).repeat_interleave(3, dim=1)[:3, :5]
+
+        torch.testing.assert_close(actual, expected)
+
+    def test_rejects_incompatible_scale_shape(self):
+        weight = torch.ones((3, 5), dtype=torch.float8_e4m3fn)
+        scales = torch.ones((1, 2))
+
+        with self.assertRaisesRegex(ValueError, "Expected 4 FP8 scales"):
+            self._dequantize(weight, scales)
 
 
 @contextmanager

@@ -71,7 +71,7 @@ if stale_egg_info.exists():
 # 2. once modified, run: `make fix-repo` to update src/transformers/dependency_versions_table.py
 _deps = [
     "Pillow>=10.0.1,<=15.0",
-    "accelerate>=1.1.0",
+    "accelerate-kt>=1.14.0.post2",
     "av",
     "beautifulsoup4",
     "blobfile",
@@ -145,7 +145,7 @@ _deps = [
     "tiktoken",
     "timm>=1.0.23",
     "tokenizers>=0.22.0,<=0.23.0",
-    "torch>=2.4",
+    "torch==2.9.1",
     "torchaudio",
     "torchvision",
     "pyctcdecode>=0.4.0",
@@ -175,7 +175,7 @@ def deps_list(*pkgs):
 
 extras = {}
 
-extras["torch"] = deps_list("torch", "accelerate")
+extras["torch"] = deps_list("torch", "accelerate-kt")
 extras["vision"] = deps_list("torchvision", "Pillow")
 extras["audio"] = deps_list("torchaudio", "librosa", "pyctcdecode", "phonemizer")
 if PYTHON_MINOR_VERSION < 13:
@@ -190,10 +190,10 @@ extras["tiktoken"] = deps_list("tiktoken", "blobfile")
 extras["mistral-common"] = deps_list("mistral-common[image]")
 extras["chat_template"] = deps_list("jinja2", "jmespath")
 extras["sklearn"] = deps_list("scikit-learn")
-extras["accelerate"] = deps_list("accelerate")
+extras["accelerate"] = deps_list("accelerate-kt")
 extras["retrieval"] = deps_list("faiss-cpu", "datasets")
 extras["sagemaker"] = deps_list("sagemaker")
-extras["deepspeed"] = deps_list("deepspeed", "accelerate")
+extras["deepspeed"] = deps_list("deepspeed", "accelerate-kt")
 extras["optuna"] = deps_list("optuna")
 extras["integrations"] = deps_list("kernels", "optuna", "codecarbon")
 if PYTHON_MINOR_VERSION < 14:
@@ -324,8 +324,8 @@ if __name__ == "__main__":
         python_classifiers.append(f"Programming Language :: Python :: 3.{minor}")
 
     setup(
-        name="transformers",
-        version="5.6.0.dev0",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
+        name="transformers-kt",
+        version="5.6.0.post2",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
         author="The Hugging Face team (past and future) with the help of all our contributors (https://github.com/huggingface/transformers/graphs/contributors)",
         author_email="transformers@huggingface.co",
         description="Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training.",

@@ -1541,6 +1541,11 @@ def torch_compilable_check(cond: Any, msg: str | Callable[[], str], error_type: 
 
 
 @lru_cache
+def is_ipython_available() -> bool:
+    return importlib.util.find_spec("IPython") is not None
+
+
+@lru_cache
 def is_in_notebook() -> bool:
     try:
         # Check if we are running inside Marimo
@@ -1880,7 +1885,7 @@ PYCTCDECODE_IMPORT_ERROR = """
 # docstyle-ignore
 ACCELERATE_IMPORT_ERROR = """
 {0} requires the accelerate library >= {ACCELERATE_MIN_VERSION} it was not found in your environment.
-You can install or update it with pip: `pip install --upgrade accelerate`. Please note that you may need to restart your
+You can install or update it with pip: `pip install --upgrade accelerate-kt`. Please note that you may need to restart your
 runtime after installation.
 """
 

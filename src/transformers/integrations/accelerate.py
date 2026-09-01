@@ -165,8 +165,12 @@ def compute_module_sizes(
 
         iterator = all_tensors()
 
+    from .kt_artifacts import is_kt_int8_routed_expert_base_parameter
+
     tied_keys = getattr(model, "all_tied_weights_keys", {}).keys()
     for name, param in iterator:
+        if is_kt_int8_routed_expert_base_parameter(param):
+            continue
         # Do not count tied keys (the model is usually not tied yet here, so they will appear in the iterator)
         # If the model is already tied, then they simply do not appear in the iterator anyway (remove_duplicates=True by default)
         if name in tied_keys:
@@ -345,37 +349,50 @@ def _get_device_map(
     """Compute the final `device_map` to use if we passed a value in ['auto', 'balanced', 'balanced_low_0', 'sequential'].
     Otherwise, we check for any device inconsistencies in the device_map.
     """
-    if isinstance(device_map, str):
-        no_split_modules = model._no_split_modules
+    inferred_device_map = isinstance(device_map, str)
+    if inferred_device_map:
+        from .kt_artifacts import project_kt_routed_experts_out_of_device_map
 
-        if device_map != "sequential":
-            inferred_max_memory = get_balanced_memory(
+        with project_kt_routed_experts_out_of_device_map(model):
+            no_split_modules = model._no_split_modules
+
+            if device_map != "sequential":
+                inferred_max_memory = get_balanced_memory(
+                    model,
+                    max_memory=max_memory,
+                    no_split_module_classes=no_split_modules,
+                    hf_quantizer=hf_quantizer,
+                    low_zero=(device_map == "balanced_low_0"),
+                )
+            else:
+                inferred_max_memory = get_max_memory(max_memory)
+
+            if hf_quantizer is not None:
+                inferred_max_memory = hf_quantizer.adjust_max_memory(inferred_max_memory)
+
+            device_map = infer_auto_device_map(
                 model,
-                max_memory=max_memory,
+                max_memory=inferred_max_memory,
                 no_split_module_classes=no_split_modules,
                 hf_quantizer=hf_quantizer,
-                low_zero=(device_map == "balanced_low_0"),
             )
-        else:
-            inferred_max_memory = get_max_memory(max_memory)
 
-        if hf_quantizer is not None:
-            inferred_max_memory = hf_quantizer.adjust_max_memory(inferred_max_memory)
+    from .kt_artifacts import prepare_kt_non_expert_device_map
 
-        device_map = infer_auto_device_map(
-            model,
-            max_memory=inferred_max_memory,
-            no_split_module_classes=no_split_modules,
-            hf_quantizer=hf_quantizer,
-        )
-
-        if hf_quantizer is not None:
-            hf_quantizer.validate_environment(device_map=device_map)
+    device_map = prepare_kt_non_expert_device_map(model, device_map)
+    if inferred_device_map and hf_quantizer is not None:
+        hf_quantizer.validate_environment(device_map=device_map)
 
     return device_map
 
 
 def accelerate_dispatch(model, hf_quantizer, device_map, offload_folder, offload_index, offload_buffers):
+    from .kt_artifacts import (
+        hide_kt_routed_experts_from_dispatch,
+        prepare_kt_non_expert_device_map,
+    )
+
+    device_map = prepare_kt_non_expert_device_map(model, device_map)
     device_map_kwargs = {
         "device_map": device_map,
         "offload_dir": offload_folder,
@@ -400,7 +417,8 @@ def accelerate_dispatch(model, hf_quantizer, device_map, offload_folder, offload
         device_map_kwargs["offload_buffers"] = True
 
     if not is_fsdp_enabled() and not is_deepspeed_zero3_enabled():
-        dispatch_model(model, **device_map_kwargs)
+        with hide_kt_routed_experts_from_dispatch(model):
+            dispatch_model(model, **device_map_kwargs)
 
 
 def expand_device_map(device_map: dict | None, param_names: list[str]):

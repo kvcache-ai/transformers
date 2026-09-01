@@ -1146,6 +1146,8 @@ class AcceleratorConfig:
                 the latter is set to 1, otherwise an exception will be raised.
               sync_each_batch (`bool`): Whether to synchronize the gradients at each data batch.
                 The [`accelerate.utils.GradientAccumulationPlugin`] default is `False`.
+        kt_config (`dict`, *optional*):
+            Keyword arguments forwarded to `accelerate.utils.KTransformersPlugin`.
         non_blocking (`bool`, *optional*, defaults to `False`):
             Whether to use non-blocking CUDA calls to help minimize synchronization during
             distributed training with prepared `DataLoader` inputs being moved to device.
@@ -1214,6 +1216,12 @@ class AcceleratorConfig:
             "    The [`accelerate.utils.GradientAccumulationPlugin`] default is `False`."
         },
     )
+    kt_config: dict | None = field(
+        default=None,
+        metadata={
+            "help": "Optional kwargs for accelerate.utils.KTransformersPlugin. Only used when accelerate is available."
+        },
+    )
     use_configured_state: bool = field(
         default=False,
         metadata={
@@ -1238,7 +1246,12 @@ class AcceleratorConfig:
         return cls(**config_dict)
 
     def to_dict(self):
-        return copy.deepcopy(self.__dict__)
+        payload = copy.deepcopy(self.__dict__)
+        if self.kt_config is not None:
+            from .integrations.kt import _serialize_kt_config
+
+            payload["kt_config"] = _serialize_kt_config(self.kt_config)
+        return payload
 
     def pop(self, key, default=None):
         return self.__dict__.pop(key, default)
