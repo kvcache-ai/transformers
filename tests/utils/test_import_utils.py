@@ -1,7 +1,13 @@
 import sys
 
 from transformers.testing_utils import run_test_using_subprocess
-from transformers.utils.import_utils import clear_import_cache
+from transformers.utils import is_torch_fx_available as exported_is_torch_fx_available
+from transformers.utils.import_utils import clear_import_cache, is_torch_available, is_torch_fx_available
+
+
+def test_torch_fx_available_alias():
+    assert is_torch_fx_available() is is_torch_available()
+    assert exported_is_torch_fx_available() is is_torch_available()
 
 
 @run_test_using_subprocess

@@ -152,6 +152,10 @@ def is_torch_available() -> bool:
         return False
 
 
+def is_torch_fx_available() -> bool:
+    return is_torch_available()
+
+
 @lru_cache
 def get_torch_version() -> str:
     _, torch_version = _is_package_available("torch", return_version=True)
