@@ -21,10 +21,12 @@ from transformers.integrations.accelerate import _get_device_map, accelerate_dis
 from transformers.integrations.kt import HfTrainerKTConfig, unset_kt_config
 from transformers.integrations.kt_artifacts import (
     claim_kt_routed_expert_subtrees,
+    get_kt_fused_lora_exclude_modules,
     hide_kt_routed_experts_from_dispatch,
     load_kt_adapter_artifacts,
     mark_kt_int8_routed_expert_base_parameters,
     prepare_kt_non_expert_device_map,
+    prepare_kt_pretrained_config,
     project_kt_routed_experts_out_of_device_map,
     resolve_kt_pretrained_artifacts,
     save_kt_adapter_artifacts,
@@ -52,6 +54,44 @@ class KTArtifactBridgeTest(unittest.TestCase):
         with patch("transformers.integrations.kt_artifacts._artifacts_api") as api:
             self.assertIsNone(resolve_kt_pretrained_artifacts("/models/base", None))
         api.assert_not_called()
+
+    def test_prepare_config_delegates_source_quantizer_ownership(self):
+        kt_config = HfTrainerKTConfig(
+            {
+                "enabled": True,
+                "kt_skip_expert_loading": True,
+                "kt_expert_weight_format": "rawint4",
+            }
+        )
+        quantization = {"quant_method": "compressed-tensors"}
+        config = SimpleNamespace(quantization_config=quantization)
+        api = SimpleNamespace(should_disable_kt_source_quantizer=Mock(return_value=True))
+
+        with patch("transformers.integrations.kt_artifacts._artifacts_api", return_value=api):
+            self.assertTrue(prepare_kt_pretrained_config(config))
+
+        self.assertFalse(hasattr(config, "quantization_config"))
+        api.should_disable_kt_source_quantizer.assert_called_once_with(kt_config, config, None)
+
+    def test_prepare_config_is_a_noop_without_active_kt_ownership(self):
+        quantization = {"quant_method": "compressed-tensors"}
+        config = SimpleNamespace(quantization_config=quantization)
+
+        with patch("transformers.integrations.kt_artifacts._artifacts_api") as api:
+            self.assertFalse(prepare_kt_pretrained_config(config))
+
+        self.assertIs(config.quantization_config, quantization)
+        api.assert_not_called()
+
+    def test_fused_lora_exclusion_is_delegated(self):
+        kt_config = HfTrainerKTConfig({"enabled": True, "kt_force_fused_expert_lora": True})
+        model = object()
+        api = SimpleNamespace(get_kt_fused_lora_exclude_modules=Mock(return_value="expert-regex"))
+
+        with patch("transformers.integrations.kt_artifacts._artifacts_api", return_value=api):
+            self.assertEqual(get_kt_fused_lora_exclude_modules(model), "expert-regex")
+
+        api.get_kt_fused_lora_exclude_modules.assert_called_once_with(kt_config, model)
 
     def test_loading_validation_and_marking_are_delegated(self):
         plan, loading_info, model = object(), object(), object()

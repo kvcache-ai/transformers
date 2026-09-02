@@ -58,6 +58,31 @@ def resolve_kt_pretrained_artifacts(
     )
 
 
+def prepare_kt_pretrained_config(config: Any, explicit_quantization_config: Any | None = None) -> bool:
+    """Let KT suppress a source quantizer for tensors owned by its runtime."""
+    artifacts = _active_artifacts_api()
+    kt_config = _get_kt_config()
+    if artifacts is None or kt_config is None:
+        return False
+    disable = artifacts.should_disable_kt_source_quantizer(
+        kt_config,
+        config,
+        explicit_quantization_config,
+    )
+    if disable and hasattr(config, "quantization_config"):
+        delattr(config, "quantization_config")
+    return bool(disable)
+
+
+def get_kt_fused_lora_exclude_modules(model: Any) -> str | None:
+    """Return the PEFT module regex owned by KT's fused expert-LoRA runtime."""
+    artifacts = _active_artifacts_api()
+    kt_config = _get_kt_config()
+    if artifacts is None or kt_config is None:
+        return None
+    return artifacts.get_kt_fused_lora_exclude_modules(kt_config, model)
+
+
 def validate_kt_pretrained_load(plan: Any, loading_info: Any, model: Any) -> None:
     if plan is not None:
         _artifacts_api().validate_kt_pretrained_load(plan, loading_info, model)

@@ -4041,7 +4041,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
 
-        from .integrations.kt_artifacts import resolve_kt_pretrained_artifacts
+        from .integrations.kt_artifacts import prepare_kt_pretrained_config, resolve_kt_pretrained_artifacts
 
         kt_load_plan = None
         if pretrained_model_name_or_path is not None:
@@ -4049,6 +4049,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 pretrained_model_name_or_path,
                 quantization_config,
             )
+        prepare_kt_pretrained_config(config, quantization_config)
         if kt_load_plan is not None and (state_dict is not None or gguf_file is not None):
             raise RuntimeError("KT non-expert cache loading cannot be combined with `state_dict` or `gguf_file`.")
         if (

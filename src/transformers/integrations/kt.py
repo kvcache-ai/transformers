@@ -252,7 +252,7 @@ def is_kt_fp8_expert_loading_enabled() -> bool:
 
 def is_kt_prequantized_expert_loading_enabled() -> bool:
     """Whether KT replaces checkpoint routed experts with a supported pre-quantized backend."""
-    return _get_kt_expert_weight_format() in {"int8", "fp8"} and is_kt_expert_loading_enabled()
+    return _get_kt_expert_weight_format() in {"int8", "fp8", "rawint4"} and is_kt_expert_loading_enabled()
 
 
 def _get_kt_expert_weight_format() -> str | None:
@@ -260,9 +260,22 @@ def _get_kt_expert_weight_format() -> str | None:
     weight_format = getattr(kt_config, "kt_expert_weight_format", None) if kt_config is not None else None
     if weight_format is None:
         weight_format = os.environ.get("ACCELERATE_KT_EXPERT_WEIGHT_FORMAT")
-    if not isinstance(weight_format, str):
+    if isinstance(weight_format, str) and weight_format.strip():
+        return weight_format.strip().lower()
+
+    backend = getattr(kt_config, "kt_backend", None) if kt_config is not None else None
+    if backend is None:
+        backend = os.environ.get("ACCELERATE_KT_BACKEND")
+    if not isinstance(backend, str):
         return None
-    return weight_format.strip().lower()
+    return {
+        "int8": "int8",
+        "amxint8": "int8",
+        "fp8": "fp8",
+        "amxfp8": "fp8",
+        "rawint4": "rawint4",
+        "amxint4_kgroup": "rawint4",
+    }.get(backend.strip().lower())
 
 
 def _validate_kt_prequantized_loading_info(loading_info: Any, model: Any | None = None) -> None:
