@@ -252,7 +252,7 @@ def is_kt_fp8_expert_loading_enabled() -> bool:
 
 def is_kt_prequantized_expert_loading_enabled() -> bool:
     """Whether KT replaces checkpoint routed experts with a supported pre-quantized backend."""
-    return _get_kt_expert_weight_format() in {"int8", "fp8"} and is_kt_expert_loading_enabled()
+    return _get_kt_expert_weight_format() in {"int8", "fp8", "rawint4"} and is_kt_expert_loading_enabled()
 
 
 def _get_kt_expert_weight_format() -> str | None:
