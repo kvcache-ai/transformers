@@ -21,7 +21,6 @@ from transformers.integrations.accelerate import _get_device_map, accelerate_dis
 from transformers.integrations.kt import HfTrainerKTConfig, unset_kt_config
 from transformers.integrations.kt_artifacts import (
     claim_kt_routed_expert_subtrees,
-    get_kt_fused_lora_exclude_modules,
     hide_kt_routed_experts_from_dispatch,
     load_kt_adapter_artifacts,
     mark_kt_int8_routed_expert_base_parameters,
@@ -82,16 +81,6 @@ class KTArtifactBridgeTest(unittest.TestCase):
 
         self.assertIs(config.quantization_config, quantization)
         api.assert_not_called()
-
-    def test_fused_lora_exclusion_is_delegated(self):
-        kt_config = HfTrainerKTConfig({"enabled": True, "kt_force_fused_expert_lora": True})
-        model = object()
-        api = SimpleNamespace(get_kt_fused_lora_exclude_modules=Mock(return_value="expert-regex"))
-
-        with patch("transformers.integrations.kt_artifacts._artifacts_api", return_value=api):
-            self.assertEqual(get_kt_fused_lora_exclude_modules(model), "expert-regex")
-
-        api.get_kt_fused_lora_exclude_modules.assert_called_once_with(kt_config, model)
 
     def test_loading_validation_and_marking_are_delegated(self):
         plan, loading_info, model = object(), object(), object()

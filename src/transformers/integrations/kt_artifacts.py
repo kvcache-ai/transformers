@@ -74,15 +74,6 @@ def prepare_kt_pretrained_config(config: Any, explicit_quantization_config: Any 
     return bool(disable)
 
 
-def get_kt_fused_lora_exclude_modules(model: Any) -> str | None:
-    """Return the PEFT module regex owned by KT's fused expert-LoRA runtime."""
-    artifacts = _active_artifacts_api()
-    kt_config = _get_kt_config()
-    if artifacts is None or kt_config is None:
-        return None
-    return artifacts.get_kt_fused_lora_exclude_modules(kt_config, model)
-
-
 def validate_kt_pretrained_load(plan: Any, loading_info: Any, model: Any) -> None:
     if plan is not None:
         _artifacts_api().validate_kt_pretrained_load(plan, loading_info, model)
