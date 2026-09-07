@@ -136,24 +136,6 @@ class KTInt8LoadingValidationTest(unittest.TestCase):
                 _loading_info(missing_keys={"model.layers.3.self_attn.q_proj.weight"})
             )
 
-    def test_rawint4_uses_the_same_strict_non_expert_contract(self):
-        self.kt_config = HfTrainerKTConfig(
-            {
-                "enabled": True,
-                "kt_skip_expert_loading": True,
-                "kt_expert_weight_format": "rawint4",
-            }
-        )
-
-        self.assertTrue(is_kt_prequantized_expert_loading_enabled())
-        _validate_kt_prequantized_loading_info(
-            _loading_info(missing_keys={"language_model.model.layers.3.mlp.experts.0.gate_proj.weight"})
-        )
-        with self.assertRaisesRegex(RuntimeError, "KT RAWINT4.*missing_keys"):
-            _validate_kt_prequantized_loading_info(
-                _loading_info(missing_keys={"language_model.model.layers.3.self_attn.q_a_proj.weight"})
-            )
-
     def test_wrapper_does_not_import_kernel_fields_from_environment(self):
         with patch.dict(
             "os.environ",

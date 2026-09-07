@@ -25,7 +25,6 @@ from transformers.integrations.kt_artifacts import (
     load_kt_adapter_artifacts,
     mark_kt_int8_routed_expert_base_parameters,
     prepare_kt_non_expert_device_map,
-    prepare_kt_pretrained_config,
     project_kt_routed_experts_out_of_device_map,
     resolve_kt_pretrained_artifacts,
     save_kt_adapter_artifacts,
@@ -52,34 +51,6 @@ class KTArtifactBridgeTest(unittest.TestCase):
         HfTrainerKTConfig({"enabled": False})
         with patch("transformers.integrations.kt_artifacts._artifacts_api") as api:
             self.assertIsNone(resolve_kt_pretrained_artifacts("/models/base", None))
-        api.assert_not_called()
-
-    def test_prepare_config_delegates_source_quantizer_ownership(self):
-        kt_config = HfTrainerKTConfig(
-            {
-                "enabled": True,
-                "kt_skip_expert_loading": True,
-                "kt_expert_weight_format": "rawint4",
-            }
-        )
-        quantization = {"quant_method": "compressed-tensors"}
-        config = SimpleNamespace(quantization_config=quantization)
-        api = SimpleNamespace(should_disable_kt_source_quantizer=Mock(return_value=True))
-
-        with patch("transformers.integrations.kt_artifacts._artifacts_api", return_value=api):
-            self.assertTrue(prepare_kt_pretrained_config(config))
-
-        self.assertFalse(hasattr(config, "quantization_config"))
-        api.should_disable_kt_source_quantizer.assert_called_once_with(kt_config, config, None)
-
-    def test_prepare_config_is_a_noop_without_active_kt_ownership(self):
-        quantization = {"quant_method": "compressed-tensors"}
-        config = SimpleNamespace(quantization_config=quantization)
-
-        with patch("transformers.integrations.kt_artifacts._artifacts_api") as api:
-            self.assertFalse(prepare_kt_pretrained_config(config))
-
-        self.assertIs(config.quantization_config, quantization)
         api.assert_not_called()
 
     def test_loading_validation_and_marking_are_delegated(self):

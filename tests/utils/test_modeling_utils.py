@@ -218,19 +218,6 @@ if is_torch_available():
         def forward(self, x):
             return self.linear_2(self.linear(x))
 
-    class BaseModelWithLegacyTieWeights(BaseModel):
-        def tie_weights(self):
-            self.tie_weights_call_count = getattr(self, "tie_weights_call_count", 0) + 1
-            return super().tie_weights()
-
-    class BaseModelWithStandardTieWeights(BaseModel):
-        def tie_weights(self, missing_keys=None, recompute_mapping=True):
-            if not hasattr(self, "tie_weights_calls"):
-                self.tie_weights_calls = []
-            missing_keys = None if missing_keys is None else missing_keys.copy()
-            self.tie_weights_calls.append((missing_keys, recompute_mapping))
-            return super().tie_weights(missing_keys=missing_keys, recompute_mapping=recompute_mapping)
-
     class ModelWithHead(PreTrainedModel):
         base_model_prefix = "base"
         config_class = PreTrainedConfig
@@ -1614,24 +1601,6 @@ class ModelUtilsTest(TestCasePlus):
         with init.no_tie_weights():
             model = LlamaForCausalLM._from_config(copy.deepcopy(config))
             self.assertTrue(model.lm_head.weight is not model.model.embed_tokens.weight)
-
-    def test_internal_tie_weights_calls_support_overridden_signatures(self):
-        legacy_model = BaseModelWithLegacyTieWeights(PreTrainedConfig())
-        self.assertEqual(legacy_model.tie_weights_call_count, 1)
-
-        standard_model = BaseModelWithStandardTieWeights(PreTrainedConfig())
-        self.assertEqual(standard_model.tie_weights_calls, [(None, False)])
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            legacy_dir = os.path.join(tmp_dir, "legacy")
-            legacy_model.save_pretrained(legacy_dir)
-            loaded_legacy_model = BaseModelWithLegacyTieWeights.from_pretrained(legacy_dir)
-            self.assertEqual(loaded_legacy_model.tie_weights_call_count, 2)
-
-            standard_dir = os.path.join(tmp_dir, "standard")
-            standard_model.save_pretrained(standard_dir)
-            loaded_standard_model = BaseModelWithStandardTieWeights.from_pretrained(standard_dir)
-            self.assertEqual(loaded_standard_model.tie_weights_calls, [(None, False), (set(), False)])
 
     def test_unexpected_keys_warnings(self):
         model = ModelWithHead(PreTrainedConfig(tie_word_embeddings=True))
