@@ -339,6 +339,20 @@ def _get_tied_weight_keys(module: nn.Module) -> list[str]:
     return tied_weight_keys
 
 
+def _call_tie_weights(model: "PreTrainedModel", **kwargs) -> None:
+    """Call an overridden `tie_weights` with only the keyword arguments it supports."""
+    parameters = inspect.signature(model.tie_weights).parameters
+    if not any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        supported_keywords = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        kwargs = {name: value for name, value in kwargs.items() if name in supported_keywords}
+
+    model.tie_weights(**kwargs)
+
+
 def _find_disjoint(tensors: list[set[str]], state_dict: dict[str, torch.Tensor]) -> tuple[list[set[str]], list[str]]:
     filtered_tensors = []
     for shared in tensors:
@@ -3076,7 +3090,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             # Initialize weights
             self.initialize_weights()
         # Tie weights needs to be called here, but it can use the pre-computed `all_tied_weights_keys`
-        self.tie_weights(recompute_mapping=False)
+        _call_tie_weights(self, recompute_mapping=False)
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         """
@@ -4041,7 +4055,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
         if "experts_implementation" in kwargs:
             config._experts_implementation = kwargs.pop("experts_implementation")
 
-        from .integrations.kt_artifacts import resolve_kt_pretrained_artifacts
+        from .integrations.kt_artifacts import prepare_kt_pretrained_config, resolve_kt_pretrained_artifacts
 
         kt_load_plan = None
         if pretrained_model_name_or_path is not None:
@@ -4049,6 +4063,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
                 pretrained_model_name_or_path,
                 quantization_config,
             )
+        prepare_kt_pretrained_config(config, quantization_config)
         if kt_load_plan is not None and (state_dict is not None or gguf_file is not None):
             raise RuntimeError("KT non-expert cache loading cannot be combined with `state_dict` or `gguf_file`.")
         if (
@@ -4440,7 +4455,7 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             model._initialize_missing_keys(load_config.is_quantized)
 
             # Tie the weights
-            model.tie_weights(missing_keys=loading_info.missing_keys, recompute_mapping=False)
+            _call_tie_weights(model, missing_keys=loading_info.missing_keys, recompute_mapping=False)
 
             # Adjust missing and unexpected keys
             model._adjust_missing_and_unexpected_keys(loading_info)
