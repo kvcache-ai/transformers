@@ -46,9 +46,7 @@ def _resolve_distribution_version(pkg: str) -> tuple[str, str]:
         except importlib.metadata.PackageNotFoundError:
             continue
     looked_up = ", ".join(candidates)
-    raise importlib.metadata.PackageNotFoundError(
-        f"Tried metadata lookup for: {looked_up}"
-    )
+    raise importlib.metadata.PackageNotFoundError(f"Tried metadata lookup for: {looked_up}")
 
 
 def _compare_versions(op, got_ver, want_ver, requirement, pkg, hint):
