@@ -227,6 +227,9 @@ class _BaseAutoModelClass:
             else:
                 repo_id = config.name_or_path
             model_class = get_class_from_dynamic_module(class_ref, repo_id, **kwargs)
+            from ...integrations.kimi_compat import prepare_remote_kimi_model_class
+
+            model_class = prepare_remote_kimi_model_class(model_class)
             # This block handles the case where the user is loading a model with `trust_remote_code=True`
             # but a library model exists with the same name. We don't want to override the autoclass
             # mappings in this case, or all future loads of that model will be the remote code model.
@@ -369,6 +372,9 @@ class _BaseAutoModelClass:
             model_class = get_class_from_dynamic_module(
                 class_ref, pretrained_model_name_or_path, code_revision=code_revision, **hub_kwargs, **kwargs
             )
+            from ...integrations.kimi_compat import prepare_remote_kimi_model_class
+
+            model_class = prepare_remote_kimi_model_class(model_class)
             _ = hub_kwargs.pop("code_revision", None)
             # This block handles the case where the user is loading a model with `trust_remote_code=True`
             # but a library model exists with the same name. We don't want to override the autoclass
