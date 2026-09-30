@@ -314,6 +314,11 @@ class XIELUActivation(nn.Module):
         return self._xielu_python(input)
 
 
+class SqrtSoftplusActivation(nn.Module):
+    def forward(self, input: Tensor) -> Tensor:
+        return nn.functional.softplus(input).sqrt()
+
+
 ACT2CLS = {
     "gelu": GELUActivation,
     "gelu_10": (ClippedGELUActivation, {"min": -10, "max": 10}),
@@ -333,6 +338,7 @@ ACT2CLS = {
     "relu2": ReLUSquaredActivation,
     "relu6": nn.ReLU6,
     "sigmoid": nn.Sigmoid,
+    "sqrtsoftplus": SqrtSoftplusActivation,
     "silu": SiLUActivation,
     "swish": nn.SiLU,
     "tanh": nn.Tanh,
