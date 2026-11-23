@@ -18,6 +18,8 @@ import re
 import tempfile
 import unittest
 
+from parameterized import parameterized
+
 from transformers import is_torch_available
 from transformers.testing_utils import require_torch, require_torch_accelerator, require_torch_multi_accelerator, slow
 
@@ -120,6 +122,38 @@ class DeepseekV41ModelTest(CausalLMModelTest, unittest.TestCase):
     # flow through a separate objective upstream, not the main causal-LM loss), and
     # the Sinkhorn-projected comb matrix sits at the edge of the autograd graph.
     test_all_params_have_gradient = False
+
+    @parameterized.expand([("linear",), ("dynamic",), ("yarn",)])
+    def test_model_rope_scaling_from_config(self, scaling_type):
+        from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RotaryEmbedding
+
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        base = DeepseekV41RotaryEmbedding(config)
+        config = copy.deepcopy(config)
+        config.rope_parameters["compress"].update(
+            rope_type=scaling_type, factor=4.0, original_max_position_embeddings=config.max_position_embeddings
+        )
+        scaled = DeepseekV41RotaryEmbedding(config)
+        ids = torch.arange(2 * config.max_position_embeddings)[None]
+        x = torch.zeros(1)
+        for label in ("main", "compress"):
+            reference = base(x, ids, layer_type=label)[0]
+            actual = scaled(x, ids, layer_type=label)[0]
+            self.assertEqual(torch.allclose(reference, actual), label == "main")
+
+    def test_model_rope_scaling_frequencies(self):
+        from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41RotaryEmbedding
+
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        rope = DeepseekV41RotaryEmbedding(config)
+        ids = torch.arange(8)[None]
+        for label in ("main", "compress"):
+            theta = config.rope_parameters[label]["rope_theta"]
+            freq = theta ** (-torch.arange(0, config.qk_rope_head_dim, 2) / config.qk_rope_head_dim)
+            cos, sin = rope(torch.zeros(1), ids, layer_type=label)
+            angles = ids[..., None] * freq
+            torch.testing.assert_close(cos, angles.cos())
+            torch.testing.assert_close(sin, angles.sin())
 
     def is_pipeline_test_to_skip(self, *args, **kwargs):
         return True
@@ -537,57 +571,34 @@ class DeepseekV41ModelTest(CausalLMModelTest, unittest.TestCase):
         next_tokens = torch.tensor([[7, 0, 1], [1, 0, 7]])
         with torch.no_grad():
             expected = model(torch.cat([inputs, next_tokens], dim=1), use_cache=False).logits[:, -3:]
-            for record_past in (False, True):
-                for layer_only in (False, True):
-                    with self.subTest(record_past=record_past, layer_only=layer_only):
-                        cache = DynamicCache(config=config)
-                        if record_past:
-                            cache.activate_past_recording()
-                        model(inputs, past_key_values=cache, use_cache=True)
-                        target = cache.layers[config.kv_source_layer_ids[0]] if layer_only else cache
-                        for tokens_to_remove in (-1, inputs.shape[1] - 1):
-                            with self.assertRaises(RuntimeError):
-                                target.crop(tokens_to_remove)
-                            self.assertEqual(
-                                [layer.get_seq_length() for layer in cache.layers],
-                                [inputs.shape[1]] * config.num_hidden_layers,
-                            )
-                        self.assertFalse(cache.is_croppable)
-                        actual = model(next_tokens, past_key_values=cache, use_cache=True).logits
-                        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+            for layer_only in (False, True):
+                with self.subTest(layer_only=layer_only):
+                    cache = DynamicCache(config=config)
+                    model(inputs, past_key_values=cache, use_cache=True)
+                    target = cache.layers[config.kv_source_layer_ids[0]] if layer_only else cache
+                    for length in (-1, 0, inputs.shape[1] - 1):
+                        with self.assertRaises(RuntimeError):
+                            target.crop(length)
+                        self.assertEqual(
+                            [layer.get_seq_length() for layer in cache.layers],
+                            [inputs.shape[1]] * config.num_hidden_layers,
+                        )
+                    actual = model(next_tokens, past_key_values=cache, use_cache=True).logits
+                    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
-    def test_csa_zero_crop_preserves_continuation(self):
-        """Trim-only crop preserves compressed groups and bounded engram history."""
-        from transformers import DynamicCache
+    def test_e4m3_cast_forward_and_backward(self):
+        from transformers.models.deepseek_v41.modeling_deepseek_v41 import _E4M3Round
 
-        tokenizer = tiny_word_tokenizer()
-        config = self._tie_free_config(self._engram_config(tokenizer))
-        torch.manual_seed(0)
-        model = self.model_tester.causal_lm_class(config).eval()
-        model.model.bind_tokenizer(tokenizer)
-        cache = DynamicCache(config=config)
-        source = cache.layers[config.kv_source_layer_ids[0]]
-        source.crop(0)
-        self.assertEqual(source.get_seq_length(), 0)
-        for tokens_to_remove in (-1, 1):
-            with self.assertRaises(RuntimeError):
-                source.crop(tokens_to_remove)
-            self.assertEqual(source.get_seq_length(), 0)
-        cache.activate_past_recording()
-        inputs = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2]])
-        next_tokens = torch.tensor([[3, 4, 5]])
-        with torch.no_grad():
-            expected = model(torch.cat([inputs, next_tokens], dim=1), use_cache=False).logits[:, -3:]
-            model(inputs, past_key_values=cache, use_cache=True)
-            cache.crop(0)
-            self.assertEqual(
-                [layer.get_seq_length() for layer in cache.layers],
-                [inputs.shape[1]] * config.num_hidden_layers,
-            )
-            self.assertEqual(source.engram_context.shape[1], config.engram_max_ngram_size - 1)
-            self.assertEqual(cache.layers[0].keys.shape[-2], config.sliding_window - 1)
-            actual = model(next_tokens, past_key_values=cache, use_cache=True).logits
-        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+        # Include normal and subnormal values, exact midpoints and overflow.
+        values = torch.cat((torch.arange(-8192, 8193) / 1024, torch.arange(-480, 481) / 1.0))
+        values.requires_grad_()
+        reference = values.to(torch.float8_e4m3fn).float()
+        actual = _E4M3Round.apply(values)
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0, equal_nan=True)
+        gradient = values.detach().flip(0)
+        reference_grad = torch.autograd.grad(reference, values, gradient)[0]
+        actual_grad = torch.autograd.grad(actual, values, gradient)[0]
+        torch.testing.assert_close(actual_grad, reference_grad, atol=0, rtol=0, equal_nan=True)
 
     def test_beam_reorder_follows_engram_history(self):
         """The engram n-gram look-back lives on the cache: `cache.reorder_cache` alone

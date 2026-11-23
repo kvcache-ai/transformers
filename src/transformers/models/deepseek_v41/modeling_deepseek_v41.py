@@ -41,12 +41,11 @@ from ...utils import TransformersKwargs, auto_docstring
 from ...utils.deprecation import deprecate_kwarg
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.hub import cached_file
-from ...utils.import_utils import is_torch_distributed_available
 from ...utils.output_capturing import OutputRecorder, capture_outputs
 from .configuration_deepseek_v41 import DeepseekV41Config, DeepseekV41TextConfig
 
 
-if is_torch_distributed_available():
+if torch.distributed.is_available():
     from torch.distributed.tensor import DTensor, Shard
 else:  # the engram table's TP path is only reachable with torch.distributed
     DTensor = Shard = None
@@ -326,10 +325,8 @@ class DeepseekV41CSACache(DeepseekV41EngramHistoryLayer, DynamicSlidingWindowLay
         self.entry_count: dict[str, torch.Tensor | None] = {"compressor": None}
         self.token_count: dict[str, torch.Tensor | None] = {"compressor": None}
 
-    def crop(self, tokens_to_remove: int) -> None:
-        # KV and engram updates already retain their needed look-back, so a
-        # trim-only crop is also a no-op before lazy initialization.
-        if tokens_to_remove != 0:
+    def crop(self, max_length: int) -> None:
+        if max_length < self.get_seq_length():
             raise RuntimeError("DeepseekV41CSACache cannot roll back compressed states.")
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
@@ -582,6 +579,29 @@ def _e2m1_codes(q: torch.Tensor) -> torch.Tensor:
     return codes | (negative.to(torch.uint8) << 3)
 
 
+class _E4M3Round(torch.autograd.Function):
+    """Emulate the two dtype casts on devices without native E4M3 conversion."""
+
+    @staticmethod
+    def forward(ctx, values):
+        magnitude = values.abs()
+        exponent = torch.floor(torch.log2(magnitude)).clamp(min=-6, max=8)
+        step = torch.exp2(exponent - 3)
+        rounded = torch.round(values / step) * step
+        return rounded.clamp(-448, 448)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # The backward of float32 -> E4M3 -> float32 also casts the gradient.
+        return _E4M3Round.apply(grad_output)
+
+
+def _round_to_e4m3(values):
+    if values.device.type == "npu":
+        return _E4M3Round.apply(values)
+    return values.to(torch.float8_e4m3fn).float()
+
+
 def _fake_quant_fp4_block(x: torch.Tensor, block_size: int, e4m3_scales: bool = False) -> torch.Tensor:
     """Block-wise FP4 fake-quantization — the reference's indexer (block 32, ue8m0
     scales) and compressed-KV (block 16, e4m3 scales) quantizers. Returns the tensor
@@ -593,7 +613,7 @@ def _fake_quant_fp4_block(x: torch.Tensor, block_size: int, e4m3_scales: bool = 
     blocks = x.float().view(*x.shape[:-1], n // block_size, block_size)
     amax = blocks.abs().amax(-1)
     if e4m3_scales:
-        scale = (amax.clamp_min(6.0 * 2.0**-9) / _FP4_MAX).to(torch.float8_e4m3fn).float()
+        scale = _round_to_e4m3(amax.clamp_min(6.0 * 2.0**-9) / _FP4_MAX)
     else:
         scale = _pow2_ceil_scale(amax.clamp_min(6.0 * 2.0**-126) * (1.0 / _FP4_MAX))
     quantized = (blocks / scale.unsqueeze(-1)).clamp(-_FP4_MAX, _FP4_MAX)
@@ -856,7 +876,7 @@ def _fake_quant_fp8_block(x: torch.Tensor, block_size: int = 32) -> torch.Tensor
     amax = blocks.abs().amax(-1).clamp_min(1e-4)
     scale = _pow2_ceil_scale(amax * (1.0 / _FP8_MAX))
     quantized = (blocks / scale.unsqueeze(-1)).clamp(-_FP8_MAX, _FP8_MAX)
-    dequantized = quantized.to(torch.float8_e4m3fn).float() * scale.unsqueeze(-1)
+    dequantized = _round_to_e4m3(quantized) * scale.unsqueeze(-1)
     return dequantized.view(*x.shape[:-1], n).to(x.dtype)
 
 
@@ -1154,7 +1174,9 @@ class DeepseekV41SparseMoeBlock(nn.Module):
         _, weights, indices = self.gate(hidden_states, image_mask)
         # routed + shared summed in fp32 (eager experts return fp32; the batched_mm /
         # grouped_mm backends return the model dtype), then one cast back.
-        y = self.experts(flat, indices, weights).float() + self.shared_experts(flat).float()
+        shared_device = self.shared_experts.gate_proj.weight.device
+        shared = self.shared_experts(flat.to(shared_device)).to(flat.device)
+        y = self.experts(flat, indices, weights).float() + shared.float()
         return y.to(hidden_states.dtype).view(shape)
 
 
@@ -1531,7 +1553,8 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         token_mask: torch.Tensor | None,
         shared: dict,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        shared = shared.copy()
         # hidden_streams: [B, S, hc, hidden]; engram_rows: this layer's gathered table
         # rows [B, S, n_hash_cols, head_dim] (None on non-engram layers)
         if self.engram is not None and engram_rows is not None:
@@ -1548,7 +1571,7 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         collapsed = self.hc_collapse(hidden_streams, attn_pre)
         ffn_output = self.mlp(self.post_attention_layernorm(collapsed))
         hidden_streams = self.hc_expand(ffn_output, residual, ffn_post, ffn_comb)
-        return hidden_streams, ffn_pre
+        return hidden_streams, ffn_pre, shared
 
 
 # Deliberate: this base serves BOTH model types. The text backbone chain
@@ -1559,6 +1582,7 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
 @auto_docstring
 class DeepseekV41PreTrainedModel(PreTrainedModel):  # trf-ignore: TRF001
     config_class = DeepseekV41TextConfig
+    supports_gradient_checkpointing = True
 
     base_model_prefix = "model"
     # `DeepseekV41EngramEmbedding` is no-split so `_no_placement_params` can exclude
@@ -1834,7 +1858,7 @@ class DeepseekV41TextModel(DeepseekV41PreTrainedModel):
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:-1], dtype=torch.float32)
         pre_mix[..., 0] = 1.0
         for layer in self.layers:
-            hidden_states, pre_mix = layer(
+            hidden_states, pre_mix, shared = layer(
                 hidden_states,
                 pre_mix,
                 engram_rows.get(layer.layer_idx),

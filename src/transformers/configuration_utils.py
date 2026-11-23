@@ -62,6 +62,7 @@ _FLOAT_TAG_VALUES = {"Infinity": float("inf"), "-Infinity": float("-inf"), "NaN"
 ALLOWED_LAYER_TYPES = (
     "full_attention",
     "sliding_attention",
+    "shared_compressed_attention",
     "chunked_attention",
     "linear_attention",  # used in minimax
     "conv",  # used in LFMv2

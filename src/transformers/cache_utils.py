@@ -1116,6 +1116,9 @@ class Cache:
 
     def crop(self, max_length: int):
         """Crop the cache to the given length"""
+        for layer in self.layers:
+            if getattr(layer, "is_croppable", True) is False and max_length < layer.get_seq_length():
+                raise RuntimeError("This cache cannot roll back compressed states.")
         for layer_idx in range(len(self.layers)):
             self.layers[layer_idx].crop(max_length)
 
@@ -1250,6 +1253,10 @@ class DynamicCache(Cache):
                 # the indices we don't need
                 elif layer_type in ("mamba", "conv", "linear_attention", "moe"):
                     layers.append(LinearAttentionLayer())
+                elif layer_type == "shared_compressed_attention":
+                    from .models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41CSACache
+
+                    layers.append(DeepseekV41CSACache(decoder_config))
                 elif layer_type == "hybrid":
                     layers.append(LinearAttentionAndFullAttentionLayer())
                 else:
