@@ -1440,10 +1440,13 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         pre_mix: torch.Tensor,
         engram_rows: torch.Tensor | None,
         token_mask: torch.Tensor | None,
+        compress_kv: torch.Tensor | None,
+        index_k: torch.Tensor | None,
         shared: dict,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        shared = shared.copy()
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, dict]:
+        # Reentrant checkpointing tracks tensors only at the top level of layer inputs and outputs.
+        shared = {**shared, "compress_kv": compress_kv, "index_k": index_k}
         # hidden_streams: [B, S, hc, hidden]; engram_rows: this layer's gathered table
         # rows [B, S, n_hash_cols, head_dim] (None on non-engram layers)
         if self.engram is not None and engram_rows is not None:
@@ -1460,7 +1463,7 @@ class DeepseekV41DecoderLayer(GradientCheckpointingLayer):
         collapsed = self.hc_collapse(hidden_streams, attn_pre)
         ffn_output = self.mlp(self.post_attention_layernorm(collapsed))
         hidden_streams = self.hc_expand(ffn_output, residual, ffn_post, ffn_comb)
-        return hidden_streams, ffn_pre, shared
+        return hidden_streams, ffn_pre, shared.pop("compress_kv"), shared.pop("index_k"), shared
 
 
 # Deliberate: this base serves BOTH model types. The text backbone chain
@@ -1738,20 +1741,20 @@ class DeepseekV41TextModel(DeepseekV41PreTrainedModel):
             for k, layer_idx in enumerate(self.config.engram_layer_ids):
                 engram_rows[layer_idx] = self.engram_tables[str(layer_idx)](hash_ids[:, :, k, :])
 
-        # `shared` carries the CSA2 group state between layers within ONE forward. It is
-        # passed as a keyword and listed in `_skip_keys_device_placement` so accelerate's
-        # hooks hand every layer the same dict instead of a per-layer copy (writes by a
-        # source layer must be visible to its consumers); readers move what they use.
+        # Keep routing metadata together. The compressed vectors cross the layer boundary as tensors.
         shared: dict = {}
+        compress_kv = index_k = None
         # One-hot initial mix: the first site collapses stream 0 only.
         pre_mix = hidden_states.new_zeros(*hidden_states.shape[:-1], dtype=torch.float32)
         pre_mix[..., 0] = 1.0
         for layer in self.layers:
-            hidden_states, pre_mix, shared = layer(
+            hidden_states, pre_mix, compress_kv, index_k, shared = layer(
                 hidden_states,
                 pre_mix,
                 engram_rows.get(layer.layer_idx),
                 None,
+                compress_kv,
+                index_k,
                 shared=shared,
                 position_embeddings=position_embeddings,
                 position_ids=position_ids,

@@ -155,6 +155,20 @@ class DeepseekV41ModelTest(CausalLMModelTest, unittest.TestCase):
             torch.testing.assert_close(cos, angles.cos())
             torch.testing.assert_close(sin, angles.sin())
 
+    @parameterized.expand([(True,), (False,)])
+    def test_checkpointed_shared_kv_gradients(self, reentrant):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        torch.manual_seed(499)
+        reference = self.model_tester.causal_lm_class(config).train()
+        checkpointed = copy.deepcopy(reference)
+        checkpointed.gradient_checkpointing_enable({"use_reentrant": reentrant})
+        ids = torch.arange(18).unsqueeze(0) % config.vocab_size
+        for model in (reference, checkpointed):
+            model(input_ids=ids, labels=ids, use_cache=False).loss.backward()
+        for (name, expected), (_, actual) in zip(reference.named_parameters(), checkpointed.named_parameters()):
+            with self.subTest(name=name):
+                torch.testing.assert_close(actual.grad, expected.grad)
+
     def is_pipeline_test_to_skip(self, *args, **kwargs):
         return True
 
