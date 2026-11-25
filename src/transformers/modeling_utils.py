@@ -4218,6 +4218,10 @@ class PreTrainedModel(nn.Module, EmbeddingAccessMixin, ModuleUtilsMixin, PushToH
             download_kwargs=download_kwargs,
         )
         loading_info, disk_offload_index = cls._load_pretrained_model(model, state_dict, checkpoint_files, load_config)
+        if kt_load_plan is not None and getattr(kt_load_plan, "mapped_parameters", None):
+            from .integrations.kt_artifacts import load_kt_mapped_parameters
+
+            load_kt_mapped_parameters(model, kt_load_plan, loading_info)
         loading_info = cls._finalize_model_loading(model, load_config, loading_info)
         if kt_load_plan is not None:
             from .integrations.kt_artifacts import validate_kt_pretrained_load

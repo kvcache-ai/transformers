@@ -74,6 +74,28 @@ def prepare_kt_pretrained_config(config: Any, explicit_quantization_config: Any 
     return bool(disable)
 
 
+def load_kt_mapped_parameters(model: Any, plan: Any, loading_info: Any) -> None:
+    """Attach frozen source tensors before the loader allocates missing parameters."""
+    from pathlib import Path
+
+    import torch
+    from safetensors import safe_open
+
+    for key, (shard, native) in plan.mapped_parameters.items():
+        if key not in loading_info.missing_keys:
+            raise ValueError(f"KT mapped parameter overlaps loaded weights: {key}")
+        module_name, attr = key.rsplit(".", 1)
+        module = model.get_submodule(module_name)
+        with safe_open(Path(plan.source_model_name_or_path) / shard, framework="pt", device="cpu") as handle:
+            tensor = handle.get_tensor(native)
+        if tensor.shape != module.get_parameter(attr).shape:
+            raise ValueError(f"Incompatible KT mapped parameter: {key}")
+        parameter = torch.nn.Parameter(tensor, requires_grad=False)
+        parameter._is_hf_initialized = True
+        setattr(module, attr, parameter)
+        loading_info.missing_keys.remove(key)
+
+
 def validate_kt_pretrained_load(plan: Any, loading_info: Any, model: Any) -> None:
     if plan is not None:
         _artifacts_api().validate_kt_pretrained_load(plan, loading_info, model)
