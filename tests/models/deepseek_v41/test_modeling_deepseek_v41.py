@@ -155,6 +155,29 @@ class DeepseekV41ModelTest(CausalLMModelTest, unittest.TestCase):
             torch.testing.assert_close(cos, angles.cos())
             torch.testing.assert_close(sin, angles.sin())
 
+    @parameterized.expand([("labels",), ("shift_labels",)])
+    def test_gradient_accumulation_with_uneven_targets(self, target_name):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        torch.manual_seed(499)
+        model = self.model_tester.causal_lm_class(config).train()
+        input_ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        labels = torch.tensor([[-100, -100, -100, 4], [-100, 6, 7, 8]])
+        num_items = labels[:, 1:].ne(-100).sum()
+        targets = labels if target_name == "labels" else torch.nn.functional.pad(labels[:, 1:], (0, 1), value=-100)
+
+        model(input_ids=input_ids, labels=labels, use_cache=False).loss.backward()
+        expected = {name: param.grad for name, param in model.named_parameters()}
+        model.zero_grad(set_to_none=True)
+
+        for ids, target in zip(input_ids.split(1), targets.split(1)):
+            model(
+                input_ids=ids, **{target_name: target}, num_items_in_batch=num_items, use_cache=False
+            ).loss.backward()
+
+        for name, param in model.named_parameters():
+            with self.subTest(name=name):
+                torch.testing.assert_close(param.grad, expected[name])
+
     @parameterized.expand([(True,), (False,)])
     def test_checkpointed_shared_kv_gradients(self, reentrant):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()

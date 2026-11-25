@@ -1842,7 +1842,7 @@ class DeepseekV41ForCausalLM(DeepseekV41PreTrainedModel, GenerationMixin):
             # `shift_labels` carries already-aligned targets (sequence / context
             # parallel training); `self.loss_function` shifts plain `labels` itself.
             loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.vocab_size, shift_labels=shift_labels
+                logits=logits, labels=labels, vocab_size=self.config.vocab_size, shift_labels=shift_labels, **kwargs
             )
 
         aux_loss = None
